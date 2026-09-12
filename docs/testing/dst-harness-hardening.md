@@ -76,3 +76,49 @@ insert/batch/update regressions verify supported operations really commit.
   test/dst/dst_operations_test.dart --concurrency=1 --reporter expanded`:
   **21 passed** (`issue2-focused.log`).
 - `dart analyze test/dst`: **no issues** (`issue2-analyze.log`).
+
+## Populated profiles and observable activity
+
+`DST_PROFILE=sparse|populated|mixed` and `DST_GRAPH_WIDTH` accompany seed/rounds in
+replay messages. Mixed alternates even populated and odd sparse seeds. Populated
+worlds create all 32 tables and 28 authored FK edges, cycles, competing unique
+writes, a verified tuple exchange, restore/redelete, retarget/detach and a blocked
+delete before random scheduling. Every scripted commit runs the same structural,
+causal, authoring and rollback observations as random operations. Complete
+collector batches are delivered; known keys only decide whether to enqueue them.
+
+`DST_METRICS` separates setup from scheduled activity, including on early failure.
+Attempts reconcile with commits, refusals, skips and unexpected failures; an
+oracle failure after a successful transaction remains a counted commit with a
+validation-failure counter. Semantic observations deduplicate field/tombstone
+HLC events. Authored edges/cycles are distinguished from visibility. Unique
+projection coverage names columns rather than inferring which overlapping index
+conflicted; a swap requires an actual different-tuple exchange.
+
+Passing 100+ round runs require at least 30 scheduled commits and merges;
+populated runs also require every declared authored FK edge and the deterministic
+semantic transitions. CI now uses four mixed seeds at 200 rounds across both
+topologies (4,800 scheduled attempts), replacing fifty shallow 20-round worlds
+(6,000 attempts). Per-simulation and job budgets are 10 and 60 minutes. These are
+configured allowances, not a measured full-depth runtime guarantee: genuine
+engine failures abort the current populated/deep runs before their full budget
+can be measured.
+
+- Final workload/rejection/runner controls: `dart test
+  test/dst/dst_workload_test.dart test/dst/dst_runner_test.dart
+  test/dst/dst_rejection_test.dart --concurrency=1 --reporter expanded`:
+  **16 passed, 1 engine failure** (`final-issue3-controls.log`). Width-two populated
+  controls pass with and without the fixed default and replay exactly in isolated
+  databases. Width-three seed 62 fails a supported swap after three competing
+  unique claims with `unique.spaceId,name`; the failing test remains enabled.
+- A 200-round width-three seed-62 replay fails during setup and correctly reports
+  **35 attempts, 34 commits, 1 unexpected failure, 0 scheduled operations**
+  (`issue3-width3-early-failure.log`). No stress coverage is credited to setup.
+- Populated seed 114 / 40 rounds exposes `unique_set_default_child.parentId`
+  UNIQUE failure on a predicate write (`issue3-populated40.log`).
+- Two independent minimal real-DB diagnostic probes in
+  `/tmp/dst-fix-probes/unique_authored_null_test.dart` both fail against unchanged
+  production: explicitly detaching a projected unique-FK loser leaves its old
+  authored reference; inserting two omitted nullable FK defaults violates the
+  unique index even with the default town present (`engine-unique-probes.log`).
+  These establish engine findings independently of the operation classifier.

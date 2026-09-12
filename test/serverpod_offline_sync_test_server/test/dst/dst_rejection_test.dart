@@ -235,6 +235,7 @@ void main() {
         );
         expect(operations.rejections, isEmpty);
         expect(operations.appliedPaths, isEmpty);
+        expect(operations.unexpected, 1);
       },
     );
   }
