@@ -118,7 +118,7 @@ class DstAuthoredOracle {
             );
           }
         }
-        final tombstone = snapshot.tombstones[rowKey];
+        final tombstone = snapshot.canonicalTombstone(table.key, row.key);
         if (tombstone == null ||
             !tombstone.reason.isSynced ||
             before?.tombstones[rowKey] == tombstone) {
@@ -135,11 +135,32 @@ class DstAuthoredOracle {
   }
 
   List<DstViolation> validate(DstSnapshot snapshot, UuidValue space) => [
+    for (final table in snapshot.rows.entries)
+      for (final row in table.value.entries)
+        if (_rows['${table.key}/${row.key}'] case final accepted?) ...[
+          if (accepted.space == space && row.value.spaceUuid != space)
+            (
+              property: 'authoredRetention',
+              detail: '${table.key}/${row.key} changed its accepted space',
+            ),
+          if (accepted.space == space &&
+              snapshot.canonicalTombstone(table.key, row.key) !=
+                  _tombstones['${table.key}/${row.key}']?.tombstone)
+            (
+              property: 'authoredRetention',
+              detail:
+                  '${table.key}/${row.key} changed its accepted visibility facts: '
+                  'expected ${_tombstones['${table.key}/${row.key}']?.tombstone}, '
+                  'found ${snapshot.canonicalTombstone(table.key, row.key)}',
+            ),
+        ],
     for (final entry in _rows.entries)
-      if (entry.value.space == space && snapshot.rowHlcs[entry.key] != entry.value.hlc)
+      if (entry.value.space == space &&
+          (!snapshot.rowHlcs.containsKey(entry.key) ||
+              snapshot.rowSpaces[entry.key] != space))
         (
           property: 'authoredRetention',
-          detail: '${entry.key} lost accepted insertion ${entry.value.hlc}',
+          detail: '${entry.key} lost its accepted row identity',
         ),
     for (final entry in _fields.entries)
       if (entry.value.space == space &&
@@ -152,15 +173,6 @@ class DstAuthoredOracle {
               '${entry.key} expected '
               '${dstValue(entry.value.value)} at ${entry.value.hlc}, found '
               '${dstValue(snapshot.authoredValue(entry.key))} at ${snapshot.fieldHlc(entry.key)}',
-        ),
-    for (final entry in _tombstones.entries)
-      if (entry.value.space == space &&
-          snapshot.tombstones[entry.key] != entry.value.tombstone)
-        (
-          property: 'authoredRetention',
-          detail:
-              '${entry.key} lost accepted tombstone '
-              '${entry.value.tombstone}, found ${snapshot.tombstones[entry.key]}',
         ),
   ];
 }

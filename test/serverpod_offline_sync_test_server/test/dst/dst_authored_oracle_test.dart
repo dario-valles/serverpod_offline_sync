@@ -280,9 +280,204 @@ void main() {
     );
   }
 
+  test(
+    'Given a city restored after its original insertion reached another replica, '
+    'when the restored facts reach that replica and an empty bootstrap, '
+    'then different raw row anchors preserve identical canonical fields and tombstones.',
+    () async {
+      final ids = DstIds(DstRandom(30));
+      final space = ids.next();
+      final source = await _replica(ids, space);
+      final receiver = await _replica(ids, space);
+      final mirror = await _replica(ids, space);
+      final city = City(id: ids.next(), name: 'original');
+      await source.withReplicaClock(
+        () => source.session.db.transactionForUser(
+          space,
+          (tx) => City.db.insertRow(source.session, city, transaction: tx),
+        ),
+      );
+      await receiver.merge(await source.collect(space), space);
+      await source.withReplicaClock(
+        () => source.session.db.transactionForUser(
+          space,
+          (tx) => City.db.deleteRow(source.session, city, transaction: tx),
+        ),
+      );
+      await source.withReplicaClock(
+        () => source.session.db.transactionForUser(
+          space,
+          (tx) => City.db.insertRow(
+            source.session,
+            city.copyWith(name: 'restored'),
+            transaction: tx,
+          ),
+        ),
+      );
+      final accepted = await DstSnapshot.capture(source);
+      final oracle = DstAuthoredOracle()..accept(accepted);
+
+      await receiver.merge(await source.collect(space), space);
+      await mirror.merge(await receiver.collect(space), space);
+      final received = await DstSnapshot.capture(receiver);
+      final bootstrapped = await DstSnapshot.capture(mirror);
+      final key = 'city/${city.id}';
+
+      expect(received.rowHlcs[key], isNot(accepted.rowHlcs[key]));
+      expect(received.renderRawMetadata(), isNot(accepted.renderRawMetadata()));
+      expect(received.tombstones[key], accepted.tombstones[key]);
+      expect(received.tombstones[key]!.clFlag, 3);
+      expect(received.renderSpace(space), accepted.renderSpace(space));
+      expect(bootstrapped.renderSpace(space), accepted.renderSpace(space));
+      expect(oracle.validate(received, space), isEmpty);
+      expect(oracle.validate(bootstrapped, space), isEmpty);
+    },
+  );
+
+  test(
+    'Given independently upserted visible cities sharing one identity, '
+    'when the newer insertion reaches an existing replica and an empty bootstrap, '
+    'then its redundant generation-one insertion marker has the same canonical facts.',
+    () async {
+      final ids = DstIds(DstRandom(31));
+      final space = ids.next();
+      final clock = DstClock();
+      final receiver = await DstReplica.create(
+        name: 'receiver',
+        spaceUuids: [space],
+        nodeUuid: ids.next(),
+        clock: clock.clock,
+      );
+      final source = await DstReplica.create(
+        name: 'source',
+        spaceUuids: [space],
+        nodeUuid: ids.next(),
+        clock: clock.clock,
+      );
+      final mirror = await DstReplica.create(
+        name: 'mirror',
+        spaceUuids: [space],
+        nodeUuid: ids.next(),
+        clock: clock.clock,
+      );
+      final city = City(id: ids.next(), name: 'original');
+      await receiver.withReplicaClock(
+        () => receiver.session.db.transactionForUser(
+          space,
+          (tx) => receiver.session.db.upsertRow(
+            city,
+            conflictColumns: [City.t.id],
+            transaction: tx,
+          ),
+        ),
+      );
+      clock.advance(const Duration(milliseconds: 1));
+      await source.withReplicaClock(
+        () => source.session.db.transactionForUser(
+          space,
+          (tx) => source.session.db.upsertRow(
+            city.copyWith(name: 'newer'),
+            conflictColumns: [City.t.id],
+            transaction: tx,
+          ),
+        ),
+      );
+      final accepted = await DstSnapshot.capture(source);
+      final oracle = DstAuthoredOracle()..accept(accepted);
+
+      await receiver.merge(await source.collect(space), space);
+      await mirror.merge(await receiver.collect(space), space);
+      final received = await DstSnapshot.capture(receiver);
+      final bootstrapped = await DstSnapshot.capture(mirror);
+      final key = 'city/${city.id}';
+
+      expect(accepted.tombstones[key], isNull);
+      expect(received.tombstones[key]!.clFlag, 1);
+      expect(received.tombstones[key]!.reason, CrdtDataDeletedReason.userInsert);
+      expect(received.rowHlcs[key], isNot(accepted.rowHlcs[key]));
+      expect(received.renderRawMetadata(), isNot(accepted.renderRawMetadata()));
+      expect(received.renderSpace(space), accepted.renderSpace(space));
+      expect(bootstrapped.renderSpace(space), accepted.renderSpace(space));
+      expect(oracle.validate(received, space), isEmpty);
+      expect(oracle.validate(bootstrapped, space), isEmpty);
+    },
+  );
+
+  test(
+    'Given an accepted live city without a delete event, '
+    'when a fabricated delete tombstone appears in the oracle input, '
+    'then the oracle rejects the unacknowledged visibility change.',
+    () async {
+      final ids = DstIds(DstRandom(32));
+      final space = ids.next();
+      final replica = await _replica(ids, space);
+      final city = City(id: ids.next(), name: 'live');
+      await replica.withReplicaClock(
+        () => replica.session.db.transactionForUser(
+          space,
+          (tx) => City.db.insertRow(replica.session, city, transaction: tx),
+        ),
+      );
+      final accepted = await DstSnapshot.capture(replica);
+      final oracle = DstAuthoredOracle()..accept(accepted);
+      final key = 'city/${city.id}';
+
+      final damaged = _copy(
+        accepted,
+        tombstones: {
+          key: (
+            hlc: accepted.rowHlcs[key]!.increment(),
+            clFlag: 2,
+            reason: CrdtDataDeletedReason.userDelete,
+          ),
+        },
+      );
+
+      expect(oracle.validate(damaged, space).map((v) => v.property), [
+        'authoredRetention',
+      ]);
+    },
+  );
+
+  test(
+    'Given an accepted live city without a newer insertion event, '
+    'when an insertion marker newer than every field clock appears in the oracle input, '
+    'then the oracle rejects the unacknowledged insertion marker.',
+    () async {
+      final ids = DstIds(DstRandom(32));
+      final space = ids.next();
+      final replica = await _replica(ids, space);
+      final city = City(id: ids.next(), name: 'live');
+      await replica.withReplicaClock(
+        () => replica.session.db.transactionForUser(
+          space,
+          (tx) => City.db.insertRow(replica.session, city, transaction: tx),
+        ),
+      );
+      final accepted = await DstSnapshot.capture(replica);
+      final oracle = DstAuthoredOracle()..accept(accepted);
+      final key = 'city/${city.id}';
+
+      final damaged = _copy(
+        accepted,
+        tombstones: {
+          key: (
+            hlc: accepted.rowHlcs[key]!.increment(),
+            clFlag: 1,
+            reason: CrdtDataDeletedReason.userInsert,
+          ),
+        },
+      );
+
+      expect(oracle.validate(damaged, space).map((v) => v.property), [
+        'authoredRetention',
+      ]);
+    },
+  );
+
   for (final metadata in [
     'field clock',
-    'insertion clock',
+    'inherited field clock',
     'tombstone clock',
     'tombstone reason',
     'projection reason',
@@ -318,8 +513,10 @@ void main() {
           before,
           fieldHlcs: metadata == 'field clock'
               ? {...before.fieldHlcs, key: before.fieldHlc(key)!.increment()}
+              : metadata == 'inherited field clock'
+              ? (Map.of(before.fieldHlcs)..remove(key))
               : null,
-          rowHlcs: metadata == 'insertion clock'
+          rowHlcs: metadata == 'inherited field clock'
               ? {...before.rowHlcs, rowKey: before.rowHlcs[rowKey]!.increment()}
               : null,
           tombstones: metadata.startsWith('tombstone')

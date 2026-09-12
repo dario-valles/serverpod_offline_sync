@@ -716,11 +716,7 @@ class DstOperations {
 
   static String _rollbackState(DstSnapshot snapshot, DstReplica replica) => [
     for (final space in replica.spaceUuids) snapshot.renderSpace(space),
-    // Rollback also preserves the sparse representation, not just its meaning.
-    ...snapshot.fieldHlcs.entries
-        .map((entry) => '${entry.key}: ${entry.value}')
-        .toList()
-      ..sort(),
+    snapshot.renderRawMetadata(),
   ].join('\n');
 
   static Future<String> _spaceProgress(DstReplica replica) async {

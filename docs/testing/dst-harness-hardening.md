@@ -7,7 +7,7 @@ revision; correcting generator inputs can change schedules between revisions.
 ## Portable oracle and independent evidence
 
 Snapshots compare all schema columns, including omitted nullable JSON values,
-portable insertion and effective field HLCs, authored values, projection reasons,
+portable effective field HLCs, authored values, projection reasons,
 and tombstone generation/HLC/reason. Absent field metadata inherits the insertion
 clock; an explicit field at that same clock is equivalent. Replica-local integer
 IDs and space/node checkpoints are not portable facts.
@@ -16,8 +16,8 @@ The generator retains submitted values before each ORM write and verifies them
 after commit. Full-row projected passthrough preserves its attempted value/HLC.
 The oracle admits only the local before/after clock delta after these checks;
 an unrelated write cannot bless prior merged corruption. Controlled initial
-fixtures may initialize it explicitly. At quiescence, accepted insertion, field
-and tombstone facts must survive LWW merging. Local FK side effects are retained
+fixtures may initialize it explicitly. At quiescence, accepted row identities/spaces, effective field facts
+and real tombstones must survive LWW merging. Local FK side effects are retained
 from the acknowledged delta; real DB scenarios cover their semantics rather
 than duplicating a general FK/unique planner.
 
@@ -122,3 +122,35 @@ can be measured.
   authored reference; inserting two omitted nullable FK defaults violates the
   unique index even with the default town present (`engine-unique-probes.log`).
   These establish engine findings independently of the operation classifier.
+
+
+## Reviewed normalization of equivalent insertion storage
+
+Raw row HLC anchors are not canonical facts independently of field clocks.
+`_applyMergeInsertForExistingRow` keeps an existing anchor and records newer field
+HLCs, whereas local restoration touches the row anchor. A real source, existing
+receiver and empty bootstrap can therefore have different raw anchors with
+identical effective field values/HLCs and real restore tombstones. The added
+control explicitly verifies that the raw anchors differ before asserting portable
+equality. Raw anchors remain in rollback fingerprints and as the fallback for
+fields without explicit clocks; changing an inherited clock remains detectable.
+
+An independently upserted newer insertion can also be encoded as a generation-1
+`userInsert` marker on an existing receiver, while the source has no tombstone.
+A separate real source/receiver/bootstrap control establishes this representation
+pair. Only that marker is normalized, and only when every effective field clock
+already includes its HLC. Future unexplained insertion markers and every real
+delete/restore tombstone remain strict. The oracle checks row identity/space and
+both presence and absence of accepted visibility facts, so fabricated tombstones
+cannot be treated as accepted deletes.
+
+The raw-anchor-only failures of sparse seeds 117/118 at the prior increment were
+oracle false positives, not engine defects. They are superseded by the final
+normalized sweep below; no domain or effective field/tombstone discrepancy was
+ignored to make that correction.
+
+- Normalization controls: `dart test test/dst/dst_authored_oracle_test.dart
+  test/dst/dst_runner_test.dart test/dst/dst_operations_test.dart
+  test/dst/dst_rejection_test.dart --concurrency=1 --reporter expanded`:
+  **40 passed** (`normalization-controls.log`), before the additional negative
+  generation-one-marker control included in the complete final DST rerun.

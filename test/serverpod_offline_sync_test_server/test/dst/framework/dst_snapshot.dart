@@ -135,6 +135,12 @@ class DstSnapshot {
   /// Every row by table name and row id, visible or not.
   final Map<String, Map<UuidValue, DstRow>> rows;
 
+  late final Map<String, UuidValue> rowSpaces = {
+    for (final table in rows.entries)
+      for (final row in table.value.entries)
+        '${table.key}/${row.key}': row.value.spaceUuid,
+  };
+
   /// The authored value of every field whose domain column differs from it.
   ///
   /// Sparse: a field with no entry here holds its authored value. See
@@ -153,6 +159,38 @@ class DstSnapshot {
   Object? authoredValue(DstFieldKey key) => projections.containsKey(key)
       ? projections[key]!.attemptedValue
       : rows[key.$1]?[key.$2]?.columns[key.$3];
+
+  /// A generation-one userInsert marker is an alternate encoding of a newer
+  /// insertion applied to an existing row. It is redundant only when every
+  /// effective field clock already includes that insertion. Real delete/restore
+  /// generations and unexplained insertion markers remain strict facts.
+  DstTombstone? canonicalTombstone(String table, UuidValue id) {
+    final tombstone = tombstones['$table/$id'];
+    if (tombstone?.clFlag == 1 &&
+        tombstone?.reason == CrdtDataDeletedReason.userInsert) {
+      final columns = rows[table]?[id]?.columns.keys
+          .where((column) => column != 'id')
+          .toList();
+      if (columns != null &&
+          columns.isNotEmpty &&
+          columns.every(
+            (column) =>
+                fieldHlc((table, id, column)) != null &&
+                fieldHlc((table, id, column))! >= tombstone!.hlc,
+          )) {
+        return null;
+      }
+    }
+    return tombstone;
+  }
+
+  /// Raw storage metadata is intentionally stricter than portable equality and
+  /// is retained for expected-rejection rollback, including redundant anchors.
+  String renderRawMetadata() => ([
+    for (final entry in rowHlcs.entries) 'row ${entry.key}: ${entry.value}',
+    for (final entry in fieldHlcs.entries) 'field ${entry.key}: ${entry.value}',
+    for (final entry in tombstones.entries) 'tombstone ${entry.key}: ${entry.value}',
+  ]..sort()).join('\n');
 
   /// Causal-length flag per row, keyed `table/rowId`.
   ///
@@ -246,10 +284,8 @@ class DstSnapshot {
         ].join(',');
         final marker = row.visible ? '' : ' HIDDEN';
         final rowKey = '$tableName/$rowId';
-        buffer
-          ..writeln('$rowKey$marker {$rendered}')
-          ..writeln('  inserted=${rowHlcs[rowKey]}');
-        final tombstone = tombstones[rowKey];
+        buffer.writeln('$rowKey$marker {$rendered}');
+        final tombstone = canonicalTombstone(tableName, rowId);
         buffer.writeln(
           '  tombstone=${tombstone == null ? null : '${tombstone.clFlag} ${tombstone.hlc} ${tombstone.reason.name}'}',
         );
