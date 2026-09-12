@@ -127,6 +127,7 @@ Future<DstRunReport> runDstSimulation({
   await replicas.first.seedDefaultTown(replicas.first.spaceUuids.first);
 
   final operations = DstOperations(random, ids);
+  operations.oracle.accept(await DstSnapshot.capture(replicas.first));
   final adversary = DstAdversary(random, replicas);
   var applied = 0;
 
@@ -173,6 +174,9 @@ Future<DstRunReport> runDstSimulation({
   }
   for (final entry in snapshots.entries) {
     violations.addAll(DstOracle.invariants(entry.value));
+    for (final space in entry.key.spaceUuids) {
+      violations.addAll(operations.oracle.validate(entry.value, space));
+    }
   }
 
   // Round trips run once the network is quiet, because each one builds a

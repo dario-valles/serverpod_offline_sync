@@ -6,8 +6,10 @@ import 'package:serverpod_offline_sync_server/serverpod_offline_sync_server.dart
 import 'package:serverpod_offline_sync_test_client/serverpod_offline_sync_test_client.dart';
 
 import '../../integration/test_tools/client_session.dart';
+import 'dst_authored.dart';
 import 'dst_random.dart';
 import 'dst_schema.dart';
+import 'dst_snapshot.dart';
 
 export 'dst_schema.dart';
 
@@ -236,6 +238,8 @@ class DstOperations {
   /// can assert the simulation actually exercised the constrained paths.
   final List<String> rejections = [];
 
+  final DstAuthoredOracle oracle = DstAuthoredOracle();
+
   /// Committed paths, retaining table and action so a sweep exposes omissions.
   final Map<String, int> appliedPaths = {};
   final Map<String, int> attemptedPaths = {};
@@ -274,14 +278,24 @@ class DstOperations {
   }) async {
     final path = '${table.tableName}.${action.name}';
     attemptedPaths.update(path, (count) => count + 1, ifAbsent: () => 1);
+    final before = await DstSnapshot.capture(replica);
+    final evidence = DstWriteEvidence(before);
     try {
       final outcome = await replica.withReplicaClock(
         () => replica.session.db.transactionForUser(
           spaceUuid,
-          (tx) => _apply(replica, table, action, tx),
+          (tx) => _apply(replica, table, action, tx, evidence),
         ),
       );
       if (outcome == DstOperationOutcome.applied) {
+        final after = await DstSnapshot.capture(replica);
+        final violations = evidence.validate(after);
+        if (violations.isNotEmpty) {
+          throw StateError(
+            '$path: $violations\nBefore:\n${before.renderSpace(spaceUuid)}\nInputs: ${evidence.values}\nAfter:\n${after.renderSpace(spaceUuid)}',
+          );
+        }
+        oracle.accept(after, before: before);
         appliedPaths.update(path, (count) => count + 1, ifAbsent: () => 1);
       }
       return outcome;
@@ -306,8 +320,19 @@ class DstOperations {
     DstTable table,
     DstAction action,
     Transaction tx,
+    DstWriteEvidence evidence,
   ) async {
     final session = replica.session;
+    void intend(
+      TableRow<UuidValue?> row, {
+      Set<String>? columns,
+      bool insertDefaults = false,
+    }) => evidence.write(
+      table.tableName,
+      row.toJson() as Map<String, dynamic>,
+      columns: columns,
+      insertDefaults: insertDefaults,
+    );
     final model = table.model;
     final visible = await model.find(session, transaction: tx);
 
@@ -319,6 +344,7 @@ class DstOperations {
       if (row == null) return DstOperationOutcome.skipped;
       // Reuse the identity and pass the materialized row through. The engine
       // must recover any authored unique/FK claim retained behind projection.
+      intend(row);
       await model.insert(session, row, tx);
       return DstOperationOutcome.applied;
     }
@@ -330,6 +356,9 @@ class DstOperations {
         final row = await _generatedRow(session, table, tx);
         if (row == null) return DstOperationOutcome.skipped;
         rows.add(row);
+      }
+      for (final row in rows) {
+        intend(row, insertDefaults: true);
       }
       if (action == DstAction.insertBatch) {
         await model.insertBatch(session, rows, tx);
@@ -344,6 +373,12 @@ class DstOperations {
       final existing = random.pickOrNull(all);
       final row = await _generatedRow(session, table, tx, existing: existing);
       if (row == null) return DstOperationOutcome.skipped;
+      intend(
+        row,
+        insertDefaults:
+            existing == null ||
+            evidence.before.rows[table.tableName]![existing.id]!.visible,
+      );
       await model.upsert(session, row, tx);
       return DstOperationOutcome.applied;
     }
@@ -383,6 +418,8 @@ class DstOperations {
         ...right,
         for (final column in columns) column: left[column],
       };
+      intend(model.fromJson(swappedLeft), columns: columns);
+      intend(model.fromJson(swappedRight), columns: columns);
       await model.updateBatch(
         session,
         [model.fromJson(swappedLeft), model.fromJson(swappedRight)],
@@ -416,6 +453,7 @@ class DstOperations {
         columns: changed,
       );
       if (row == null) return DstOperationOutcome.skipped;
+      intend(row);
       await model.update(session, row, null, tx);
       return DstOperationOutcome.applied;
     }
@@ -431,6 +469,12 @@ class DstOperations {
     if (updatedFirst == null) return DstOperationOutcome.skipped;
     if (action == DstAction.updateWhere) {
       final data = updatedFirst.toJson() as Map<String, dynamic>;
+      for (final row in selected) {
+        evidence.write(table.tableName, {
+          ...row.toJson() as Map<String, dynamic>,
+          for (final column in changed) column: data[column],
+        }, columns: changed);
+      }
       await model.updateWhere(session, selected.map((row) => row.id!).toSet(), {
         for (final column in changed) column: data[column],
       }, tx);
@@ -447,8 +491,12 @@ class DstOperations {
         if (row == null) return DstOperationOutcome.skipped;
         updated.add(row);
       }
+      for (final row in updated) {
+        intend(row, columns: changed);
+      }
       await model.updateBatch(session, updated, changed, tx);
     } else {
+      intend(updatedFirst, columns: changed);
       await model.update(session, updatedFirst, changed, tx);
     }
     return DstOperationOutcome.applied;
