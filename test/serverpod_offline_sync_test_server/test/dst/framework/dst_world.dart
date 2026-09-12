@@ -8,6 +8,7 @@ import 'package:serverpod_offline_sync_test_client/serverpod_offline_sync_test_c
 import '../../integration/test_tools/client_session.dart';
 import 'dst_authored.dart';
 import 'dst_random.dart';
+import 'dst_rejection.dart';
 import 'dst_schema.dart';
 import 'dst_snapshot.dart';
 
@@ -216,7 +217,7 @@ enum DstOperationOutcome {
   applied,
 
   /// The engine refused the operation by design - a no-action violation, a
-  /// unique conflict, or a reference to a row that is not visible in space.
+  /// required set-null delete, or a restored reference unavailable in space.
   rejected,
 
   /// There was nothing to act on (for example a delete with no rows yet).
@@ -280,15 +281,21 @@ class DstOperations {
     attemptedPaths.update(path, (count) => count + 1, ifAbsent: () => 1);
     final before = await DstSnapshot.capture(replica);
     final evidence = DstWriteEvidence(before);
+    final refusal = DstRejection(before, spaceUuid);
+    final progressBefore = await _spaceProgress(replica);
     try {
       final outcome = await replica.withReplicaClock(
         () => replica.session.db.transactionForUser(
           spaceUuid,
-          (tx) => _apply(replica, table, action, tx, evidence),
+          (tx) => _apply(replica, spaceUuid, table, action, tx, evidence, refusal),
         ),
       );
       if (outcome == DstOperationOutcome.applied) {
         final after = await DstSnapshot.capture(replica);
+        final blockers = refusal.deleteReasons(definiteOnly: true).toList();
+        if (blockers.isNotEmpty) {
+          throw StateError('Blocked $path unexpectedly committed: $blockers');
+        }
         final violations = evidence.validate(after);
         if (violations.isNotEmpty) {
           throw StateError(
@@ -301,7 +308,18 @@ class DstOperations {
       return outcome;
     } on Exception catch (exception) {
       final message = exception.toString();
-      if (_isExpectedRejection(message, table, action)) {
+      if (refusal.accepts(message, evidence)) {
+        final after = await DstSnapshot.capture(replica);
+        final progressAfter = await _spaceProgress(replica);
+        if (_rollbackState(before, replica) != _rollbackState(after, replica) ||
+            progressBefore != progressAfter) {
+          throw StateError(
+            'Rejected $path left domain or authored progress: $message\n'
+            'Before: ${_rollbackState(before, replica)}\n'
+            'After: ${_rollbackState(after, replica)}\n'
+            'Scope progress before: $progressBefore\nAfter: $progressAfter',
+          );
+        }
         rejections.add(message);
         return DstOperationOutcome.rejected;
       }
@@ -317,10 +335,12 @@ class DstOperations {
 
   Future<DstOperationOutcome> _apply(
     DstReplica replica,
+    UuidValue spaceUuid,
     DstTable table,
     DstAction action,
     Transaction tx,
     DstWriteEvidence evidence,
+    DstRejection refusal,
   ) async {
     final session = replica.session;
     void intend(
@@ -334,10 +354,15 @@ class DstOperations {
       insertDefaults: insertDefaults,
     );
     final model = table.model;
-    final visible = await model.find(session, transaction: tx);
+    final visible = await model.find(session, transaction: tx, spaceUuid: spaceUuid);
 
     if (action == DstAction.restore) {
-      final all = await model.find(session, transaction: tx, includeHidden: true);
+      final all = await model.find(
+        session,
+        transaction: tx,
+        includeHidden: true,
+        spaceUuid: spaceUuid,
+      );
       final visibleIds = visible.map((row) => row.id).toSet();
       final hidden = all.where((row) => !visibleIds.contains(row.id)).toList();
       final row = random.pickOrNull(hidden);
@@ -345,6 +370,7 @@ class DstOperations {
       // Reuse the identity and pass the materialized row through. The engine
       // must recover any authored unique/FK claim retained behind projection.
       intend(row);
+      evidence.visibility(table.tableName, [row.id!], deleted: false);
       await model.insert(session, row, tx);
       return DstOperationOutcome.applied;
     }
@@ -353,7 +379,7 @@ class DstOperations {
       final rows = <TableRow<UuidValue?>>[];
       final count = action == DstAction.insertBatch ? 2 : 1;
       for (var index = 0; index < count; index++) {
-        final row = await _generatedRow(session, table, tx);
+        final row = await _generatedRow(session, table, tx, spaceUuid);
         if (row == null) return DstOperationOutcome.skipped;
         rows.add(row);
       }
@@ -369,9 +395,20 @@ class DstOperations {
     }
 
     if (action == DstAction.upsert) {
-      final all = await model.find(session, transaction: tx, includeHidden: true);
+      final all = await model.find(
+        session,
+        transaction: tx,
+        includeHidden: true,
+        spaceUuid: spaceUuid,
+      );
       final existing = random.pickOrNull(all);
-      final row = await _generatedRow(session, table, tx, existing: existing);
+      final row = await _generatedRow(
+        session,
+        table,
+        tx,
+        spaceUuid,
+        existing: existing,
+      );
       if (row == null) return DstOperationOutcome.skipped;
       intend(
         row,
@@ -379,6 +416,10 @@ class DstOperations {
             existing == null ||
             evidence.before.rows[table.tableName]![existing.id]!.visible,
       );
+      if (existing != null &&
+          !evidence.before.rows[table.tableName]![existing.id]!.visible) {
+        evidence.visibility(table.tableName, [row.id!], deleted: false);
+      }
       await model.upsert(session, row, tx);
       return DstOperationOutcome.applied;
     }
@@ -386,6 +427,8 @@ class DstOperations {
     if (visible.isEmpty) return DstOperationOutcome.skipped;
     final first = random.pick(visible);
     if (action == DstAction.delete) {
+      refusal.delete(table, [first.id!]);
+      evidence.visibility(table.tableName, [first.id!], deleted: true);
       await model.delete(session, first, tx);
       return DstOperationOutcome.applied;
     }
@@ -394,10 +437,22 @@ class DstOperations {
     final second = random.pickOrNull(rest);
     final selected = [first, ?second];
     if (action == DstAction.deleteBatch) {
+      refusal.delete(table, selected.map((row) => row.id!));
+      evidence.visibility(
+        table.tableName,
+        selected.map((row) => row.id!),
+        deleted: true,
+      );
       await model.deleteBatch(session, selected, tx);
       return DstOperationOutcome.applied;
     }
     if (action == DstAction.deleteWhere) {
+      refusal.delete(table, selected.map((row) => row.id!));
+      evidence.visibility(
+        table.tableName,
+        selected.map((row) => row.id!),
+        deleted: true,
+      );
       await model.deleteWhere(session, selected.map((row) => row.id!).toSet(), tx);
       return DstOperationOutcome.applied;
     }
@@ -449,6 +504,7 @@ class DstOperations {
         session,
         table,
         tx,
+        spaceUuid,
         existing: first,
         columns: changed,
       );
@@ -463,6 +519,7 @@ class DstOperations {
       session,
       table,
       tx,
+      spaceUuid,
       existing: first,
       columns: changed,
     );
@@ -485,6 +542,7 @@ class DstOperations {
           session,
           table,
           tx,
+          spaceUuid,
           existing: second,
           columns: changed,
         );
@@ -510,7 +568,8 @@ class DstOperations {
   Future<TableRow<UuidValue?>?> _generatedRow(
     DatabaseSession session,
     DstTable table,
-    Transaction tx, {
+    Transaction tx,
+    UuidValue spaceUuid, {
     TableRow<UuidValue?>? existing,
     Set<String>? columns,
   }) async {
@@ -528,7 +587,9 @@ class DstOperations {
       );
       if (edges.isNotEmpty) {
         final edge = edges.single;
-        final parent = await _pickRow(edge.parent.model.find(session, transaction: tx));
+        final parent = await _pickRow(
+          edge.parent.model.find(session, transaction: tx, spaceUuid: spaceUuid),
+        );
         if (parent == null && !edge.nullable) return null;
         data[column.name] = edge.nullable && random.chance(0.25)
             ? null
@@ -558,52 +619,19 @@ class DstOperations {
 
   String _name(String prefix) => '$prefix-${random.nextInt(1000)}';
 
-  /// Whether [message] is a refusal the engine makes by design.
-  ///
-  /// The list is deliberately narrow. An unrecognized failure is rethrown so a
-  /// real defect surfaces as a failing seed instead of being absorbed as an
-  /// expected rejection.
-  static bool _isExpectedRejection(
-    String message,
-    DstTable table,
-    DstAction action,
-  ) {
-    if (action == DstAction.delete ||
-        action == DstAction.deleteBatch ||
-        action == DstAction.deleteWhere) {
-      final deletedTables = {table};
-      var grew = true;
-      while (grew) {
-        grew = false;
-        for (final edge in dstForeignKeys) {
-          if (edge.action == 'cascade' && deletedTables.contains(edge.parent)) {
-            grew = deletedTables.add(edge.child) || grew;
-          }
-        }
-      }
-      for (final edge in dstForeignKeys) {
-        if (edge.action == 'setNull' &&
-            !edge.nullable &&
-            deletedTables.contains(edge.parent) &&
-            message.contains(
-              'NOT NULL constraint failed: ${edge.child.tableName}.${edge.column},',
-            )) {
-          return true;
-        }
-      }
-    }
-    const expected = [
-      // `_assertVisibleForeignKeyTargets`: the target is tombstoned, missing,
-      // or owned by another space - the three are one branch by design.
-      'Cannot reference deleted row',
-      // A local `onDelete=NoAction` parent delete with a visible child still
-      // referencing it.
-      'Cannot delete',
-      // Constraint rejections surfaced by the database itself.
-      'UNIQUE constraint failed',
-      'FOREIGN KEY constraint failed',
-    ];
-    return expected.any(message.contains);
+  static String _rollbackState(DstSnapshot snapshot, DstReplica replica) => [
+    for (final space in replica.spaceUuids) snapshot.renderSpace(space),
+    // Rollback also preserves the sparse representation, not just its meaning.
+    ...snapshot.fieldHlcs.entries
+        .map((entry) => '${entry.key}: ${entry.value}')
+        .toList()
+      ..sort(),
+  ].join('\n');
+
+  static Future<String> _spaceProgress(DstReplica replica) async {
+    final nodes = await OfflineSyncSpaceNode.db.find(replica.rawSession);
+    final values = nodes.map((node) => node.toJson().toString()).toList()..sort();
+    return values.join('\n');
   }
 }
 

@@ -54,3 +54,25 @@ The starting revision's seed 114 / 200-round engine failures remain deferred:
 empty-replica bootstrap violates `unique.spaceId,name`, and overlapping spaces
 rematerialize a mixed unique FK name differently. Collector interleaving bug #84
 is outside this task. No engine failure is skipped or converted to success.
+
+## Concrete operations and refusals
+
+All generator reads, including parent selection, use the public `spaceEquals`
+filter. Production space-scoped reads are membership-wide, so a transaction's acting
+space alone does not constrain those reads. Admin snapshots remain unfiltered.
+Refusal prediction follows the selected row IDs through the cascade closure;
+no-action children, non-null SET NULL children, and unavailable defaults justify
+only their exact exceptions. A default deleted in the same batch is unavailable.
+Definite blockers also fail an unexpected successful return. Successful primary
+delete/restore intents must advance the authored tombstone with the right parity.
+
+Expected refusals compare the whole domain/authored/projection/tombstone state,
+explicit field-clock representation, and persisted space-node progress before
+and after the transaction. Arbitrary UNIQUE and FOREIGN KEY errors propagate.
+Real SQLite trigger fault injection checks that path; ordinary competing unique
+insert/batch/update regressions verify supported operations really commit.
+
+- Rejection increment: `dart test test/dst/dst_rejection_test.dart
+  test/dst/dst_operations_test.dart --concurrency=1 --reporter expanded`:
+  **21 passed** (`issue2-focused.log`).
+- `dart analyze test/dst`: **no issues** (`issue2-analyze.log`).

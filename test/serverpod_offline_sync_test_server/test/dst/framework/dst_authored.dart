@@ -13,6 +13,13 @@ class DstWriteEvidence {
   final DstSnapshot before;
   final Map<DstFieldKey, Object?> values = {};
   final Map<DstFieldKey, Hlc?> preservedClocks = {};
+  final Map<String, bool> _visibilityChanges = {};
+
+  void visibility(String table, Iterable<UuidValue> ids, {required bool deleted}) {
+    for (final id in ids) {
+      _visibilityChanges['$table/$id'] = deleted;
+    }
+  }
 
   void write(
     String table,
@@ -42,6 +49,19 @@ class DstWriteEvidence {
   }
 
   List<DstViolation> validate(DstSnapshot after) => [
+    for (final entry in _visibilityChanges.entries)
+      if (after.tombstones[entry.key] == null ||
+          after.tombstones[entry.key]!.clFlag <=
+              (before.tombstones[entry.key]?.clFlag ?? 1) ||
+          after.tombstones[entry.key]!.clFlag.isEven != entry.value ||
+          after.tombstones[entry.key]!.hlc <=
+              (before.tombstones[entry.key]?.hlc ?? before.rowHlcs[entry.key]!))
+        (
+          property: 'acceptedVisibility',
+          detail:
+              '${entry.key} accepted '
+              '${entry.value ? 'delete' : 'restore'} without advancing its authored tombstone',
+        ),
     for (final entry in values.entries)
       if (after.fieldHlc(entry.key) == null ||
           dstValue(after.authoredValue(entry.key)) != dstValue(entry.value))
