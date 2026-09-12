@@ -154,3 +154,100 @@ ignored to make that correction.
   test/dst/dst_rejection_test.dart --concurrency=1 --reporter expanded`:
   **40 passed** (`normalization-controls.log`), before the additional negative
   generation-one-marker control included in the complete final DST rerun.
+
+Two further public-API controls cover full-row visible upserts of a projected
+town, both with the equivalent generation-one marker and after a real restore.
+Changing only its name preserves the attempted FK value and its HLC. Upsert does
+not advance the raw row anchor; a restored row can legitimately retain an older
+projected FK clock while its real generation-three tombstone remains strict.
+Both controls pass (`projected-upsert-controls.log`) and are permanent in
+`dst_insertion_representation_test.dart`, included in the final DST suite below.
+
+## Final validation and remaining engine failures
+
+Use the pinned Dart binary above for every `dart` command. Test-server commands
+run from `test/serverpod_offline_sync_test_server`; the core suite runs from
+`packages/serverpod_offline_sync`. These runs overlap and their totals must not
+be added together.
+
+| Check | Command | Result | Revision and log |
+| --- | --- | --- | --- |
+| Complete untagged DST | `dart test test/dst --concurrency=1 --reporter expanded` | 73 passed, 2 engine failures, 3 tagged-suite skips | Final normalized implementation plus the two permanent insertion controls; `final-dst-all.log` |
+| Sparse baseline-size sweep | `DST_SEED_BASE=114 DST_SEEDS=8 DST_ROUNDS=40 DST_PROFILE=sparse DST_GRAPH_WIDTH=2 dart test -P dst test/dst --concurrency=1 --reporter expanded` | 14 passed, 5 engine failures | `0d9829a`; `final-normalized-sparse40.log` |
+| Stronger CI configuration | `DST_SEED_BASE=114 DST_SEEDS=4 DST_ROUNDS=200 DST_PROFILE=mixed DST_GRAPH_WIDTH=2 dart test -P dst test/dst --concurrency=1 --reporter expanded` | 3 passed, 8 engine failures | Pre-normalization `93a45cb`; `final-ci-mixed200.log` |
+| Complete ordinary test-server suite | `dart test --concurrency=1 --reporter expanded` | 816 passed, 2 engine failures, 3 tagged-suite skips | Pre-normalization `93a45cb`; `final-server-suite.log` |
+| Core package suite | `dart test --concurrency=1 --reporter expanded` | 56 passed | Production unchanged; `final-core-suite.log` |
+| DST analyzer | `dart analyze test/dst` | No issues | Final files; `final-focused-analyze.log` |
+| Workspace analyzer | `dart analyze` from repository root | 1 existing deprecated-lint warning | `analysis_options.yaml:110`, also present at starting revision; `final-normalized-analyze.log` |
+| Formatting | `dart format --output=none --set-exit-if-changed test/serverpod_offline_sync_test_server/test/dst` from root | 23 files, 0 changed | Final files |
+| Whitespace | `git diff --check` | Passed | Final files |
+
+The final untagged failures are the existing 400-operation test reaching a
+supported `unique_uuid.insertBatch` rejected by SQLite, and the width-three
+populated replay reaching the supported unique swap described above. The sparse
+sweep has 11 passing simulations plus 3 ownership checks; its five failures are
+physical UNIQUE refusals: overlapping seed 119 (`unique_uuid.insert`), and
+single-space seeds 114 (`unique_uuid.insert`), 115 and 120
+(`unique_uuid.insertBatch`), and 118 (`unique_set_default_child.insert`). The
+previous raw-anchor false positives no longer occur.
+
+The deeper mixed run fails before completing its requested schedules. Six
+simulations expose physical UNIQUE refusals on supported insert/update/upsert
+paths, one overlapping run accepts a `unique_nullable.upsert` value of 1 but
+retains 0, and one single-space run advances a projected passthrough field HLC
+during `unique_overlapping.fullRowUpdate`. These local-operation failures precede
+portable normalization, so the normalization correction does not invalidate
+their diagnostic evidence. The pre-normalization full server/CI runs are not
+claims that those complete suites passed on the final revision.
+
+The final sparse sweep reports **1,630 attempted, 721 committed, 2 expected
+rejections, 902 skipped, 5 unexpected failures**, all scheduled operations. The
+deeper mixed run reports **1,486 attempted, 1,026 committed, 30 expected
+rejections, 424 skipped, 6 unexpected failures**, including 2 committed writes
+with validation failures. Of those attempts, 246 were setup; the schedule reached
+1,240 attempts and 786 commits. Metrics record actual activity rather than
+crediting the configured 200 rounds when an engine failure stops execution.
+
+Production packages, the deferred bootstrap/round-trip engine defects and
+collector bug #84 remain unchanged. The harness deliberately retains failing
+regressions and surfaces the newly observable engine findings. Independent
+coordinator review completed with no remaining findings, including source,
+formatting and Given/when/then descriptions; its focused runs passed 31 distinct
+authored/rejection/runner and projected insertion controls.
+
+
+## 2026-09-14 rebase validation
+
+Rebased the five hardening commits onto `b89725f` with the OfflineSync/Space
+vocabulary. Production packages and model/migration definitions match that base.
+All 28 changed Dart declaration snapshots across the five commits match their
+original code after terminology and formatting changes, including assertions,
+timeouts, refusal classification and workload budgets. Each commit retains its
+original file boundaries and author. Workspace analysis and changed-file
+formatting pass with Dart 3.12.2 from Flutter 3.44.4.
+
+The documented deep replay was rerun from the test server with
+`DST_SEED_BASE=114 DST_SEEDS=4 DST_ROUNDS=200 DST_PROFILE=mixed
+DST_GRAPH_WIDTH=2 dart test -P dst test/dst --concurrency=1 --reporter expanded`.
+It again reports **3 passed and 8 retained engine failures**: six physical UNIQUE
+refusals, the overlapping seed-115 `unique_nullable.upsert` accepted-value loss,
+and the single-space seed-117 `unique_overlapping.fullRowUpdate` passthrough-clock
+advance. The physical refusals are overlapping seeds 114
+(`unique_set_null_child.updateWhere`), 116 (`unique_fk_pair.updateWhere`) and 117
+(`unique_discriminator.upsert`), and single-space seeds 114
+(`unique_set_default_child.updateWhere`), 115 (`unique_uuid.insertBatch`) and 116
+(`unique_cascade_child.upsert`).
+
+The metrics exactly reproduce the previously documented deep run: **1,486
+attempted, 1,026 committed, 30 expected refusals, 424 skipped, 6 unexpected
+failures and 2 committed validation failures**. Setup accounts for 246 attempts;
+scheduled work reaches 1,240 attempts and 786 commits. The simulations still stop
+on engine failures before completing their configured 200 rounds. No failing
+regression was skipped or converted into an expected refusal during this rebase.
+
+The complete ordinary test-server suite (`dart test test/ --concurrency=1`)
+reports **842 passed, 2 retained engine failures and 3 tagged-suite skips**.
+The failures remain the 400-operation `unique_uuid.insertBatch` control and the
+width-three seed-62 populated `unique.swapUnique` control. The rebase logs are in
+`/tmp/offline-sync-rebase/pr-123-test-app.log` and
+`/tmp/offline-sync-rebase/pr-123-dst-mixed200.log` on the validation workstation.
