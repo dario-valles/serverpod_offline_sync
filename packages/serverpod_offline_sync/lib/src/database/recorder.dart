@@ -372,6 +372,42 @@ class CrdtMutationRecorder {
     );
   }
 
+  /// Returns whether primary-key upserts preserve the existing projection.
+  Future<bool> prepareLocalUpsert<T extends TableRow>(
+    List<T> rows,
+    List<Column> conflictColumns,
+    List<Column>? updateColumns,
+    Transaction transaction,
+  ) async {
+    final tableName = rows.first.table.tableName;
+    final rowIds = {
+      for (final row in rows)
+        if (row.id case final UuidValue rowId) rowId,
+    };
+    if (conflictColumns.length == 1 &&
+        conflictColumns.single.columnName == 'id' &&
+        rowIds.length == rows.length) {
+      final stored = await _context.findCrdtRows(tableName, rowIds, transaction);
+      if (stored.isEmpty &&
+          !_foreignKeys.tablesWithDefaultDependencies.contains(tableName)) {
+        // The full pass has no persisted seed or default to load. Classification
+        // after the physical upsert still reads metadata again.
+        return false;
+      }
+      if (stored.length == rowIds.length &&
+          await _foreignKeyProjector.canLeaveLocalProjectionUnchanged(
+            rows,
+            transaction,
+            inserting: false,
+            columns: updateColumns,
+          )) {
+        return true;
+      }
+    }
+    await projectCurrent(tableName, rowIds, transaction);
+    return false;
+  }
+
   /// Plans FK/unique projection for rows that are about to be inserted.
   ///
   /// Releases hidden unique claims first and returns copies whose unique/FK
@@ -389,6 +425,15 @@ class CrdtMutationRecorder {
     if (tableName == null ||
         !_context.isCrdtTrackedTableName(tableName) ||
         !_foreignKeyProjector.needsProjection(tableName, null)) {
+      return (rows: rows, attempts: unplanned);
+    }
+
+    if (await _foreignKeyProjector.canLeaveLocalProjectionUnchanged(
+      rows,
+      transaction,
+      inserting: true,
+      persisted: false,
+    )) {
       return (rows: rows, attempts: unplanned);
     }
 
@@ -447,17 +492,29 @@ class CrdtMutationRecorder {
   }
 
   /// Plans FK/unique projection for rows that are about to be updated.
-  Future<List<T>> planLocalUpdates<T extends TableRow>(
+  Future<({List<T> rows, bool projectionUnchanged})>
+  planLocalUpdates<T extends TableRow>(
     List<T> rows,
     List<Column>? columns,
     Transaction transaction,
   ) async {
-    if (rows.isEmpty) return rows;
+    if (rows.isEmpty) return (rows: rows, projectionUnchanged: true);
     final tableName = rows.first.table.tableName;
-    if (!_context.isCrdtTrackedTableName(tableName)) return rows;
+    if (!_context.isCrdtTrackedTableName(tableName)) {
+      return (rows: rows, projectionUnchanged: true);
+    }
     final columnNames = columns?.map((column) => column.columnName).toSet();
     if (!_foreignKeyProjector.needsProjection(tableName, columnNames)) {
-      return rows;
+      return (rows: rows, projectionUnchanged: true);
+    }
+
+    if (await _foreignKeyProjector.canLeaveLocalProjectionUnchanged(
+      rows,
+      transaction,
+      inserting: false,
+      columns: columns,
+    )) {
+      return (rows: rows, projectionUnchanged: true);
     }
 
     final authored = {
@@ -500,13 +557,16 @@ class CrdtMutationRecorder {
           if (row.id case final UuidValue rowId) (tableName, rowId),
       },
     );
-    return [
-      for (final row in rows)
-        _withPlannedDomainValues(
-          row,
-          planned.domain[(tableName, row.id as UuidValue)],
-        ),
-    ];
+    return (
+      projectionUnchanged: false,
+      rows: [
+        for (final row in rows)
+          _withPlannedDomainValues(
+            row,
+            planned.domain[(tableName, row.id as UuidValue)],
+          ),
+      ],
+    );
   }
 
   Map<String, Object?> _authoredValuesFromRow<T extends TableRow>(
@@ -538,7 +598,10 @@ class CrdtMutationRecorder {
         data[column.fieldName] = planned[column.columnName];
       }
     }
-    final className = data.remove('__className__') as String?;
+    final className =
+        _session.db.serializationManager.getClassNameForObject(row) ??
+        data['__className__'] as String?;
+    data.remove('__className__');
     if (className == null) {
       throw StateError(
         'Cannot apply planned domain values: ${row.runtimeType} has no class name.',
@@ -613,7 +676,14 @@ class CrdtMutationRecorder {
         transaction,
         attempts,
       );
-      await _maybeProject(tableName, rowIds, null, transaction);
+      if (_foreignKeyProjector.needsProjection(tableName, null) &&
+          !await _foreignKeyProjector.canLeaveLocalProjectionUnchanged(
+            insertedRows,
+            transaction,
+            inserting: true,
+          )) {
+        await _maybeProject(tableName, rowIds, null, transaction);
+      }
     });
   }
 
@@ -667,8 +737,9 @@ class CrdtMutationRecorder {
   Future<void> afterUpdate<T extends TableRow>(
     List<T> updatedRows,
     List<Column>? columns,
-    Transaction transaction,
-  ) async {
+    Transaction transaction, {
+    bool projectionUnchanged = false,
+  }) async {
     await _foreignKeyProjector.assertVisibleTargets(updatedRows, columns, transaction);
 
     await _forTrackedRows(updatedRows, transaction, (
@@ -696,6 +767,15 @@ class CrdtMutationRecorder {
         transaction,
         skippedFields: implicitForeignKeyRepairFields,
       );
+      if (projectionUnchanged &&
+          await _foreignKeyProjector.canLeaveLocalProjectionUnchanged(
+            updatedRows,
+            transaction,
+            inserting: false,
+            columns: columns,
+          )) {
+        return;
+      }
       final updatedColumnNames = columns?.map((column) => column.columnName).toSet();
       await _maybeProject(
         tableName,

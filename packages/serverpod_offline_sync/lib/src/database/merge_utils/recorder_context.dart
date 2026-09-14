@@ -148,6 +148,95 @@ class CrdtRecorderContext {
     return crdtDataRows;
   }
 
+  /// Checks local projection dependencies in one database snapshot.
+  Future<bool> localProjectionDependenciesAreStable({
+    required String tableName,
+    required Set<UuidValue> rowIds,
+    required bool persisted,
+    required Map<String, Set<UuidValue>> parentsByTable,
+    required Map<String, Set<String>> referencingColumnsByTable,
+    required List<Map<String, Set<Object?>>> uniqueClaims,
+    required Transaction transaction,
+  }) async {
+    final (tableId, _) = schema[tableName]!;
+    final scopeId = hlcManagerFor(transaction).normalizedScopeId;
+    final ids = rowIds.sqlLiteralList();
+    final rowPredicate =
+        'r."scopeId" = $scopeId AND r."tblId" = $tableId '
+        'AND r."uuidRowId" IN ($ids)';
+    final conditions = <String>[
+      if (persisted)
+        '''(SELECT COUNT(*) FROM "crdt_data_rows" r
+LEFT JOIN "crdt_data_tombstone" d ON d."rowId" = r."id"
+WHERE $rowPredicate AND ($_rowVisible)
+  AND (d."id" IS NULL OR d."clFlag" % 2 = 1)) = ${rowIds.length}'''
+      else
+        'NOT EXISTS (SELECT 1 FROM "crdt_data_rows" r WHERE $rowPredicate)',
+      // An attempted FK may own a unique fallback different from its authored value.
+      '''NOT EXISTS (
+SELECT 1 FROM "crdt_data_attempted_value" a
+JOIN "crdt_data_fields" f ON f."id" = a."fieldId"
+JOIN "crdt_data_rows" r ON r."id" = f."rowId"
+WHERE r."scopeId" = $scopeId AND r."tblId" = $tableId)''',
+    ];
+    for (final MapEntry(key: parentTable, value: parentIds) in parentsByTable.entries) {
+      final (parentTableId, _) = schema[parentTable]!;
+      conditions.add('''(SELECT COUNT(*)
+FROM "${parentTable.escapeIdentifier()}" p
+JOIN "crdt_data_rows" r ON r."uuidRowId" = p."id"
+  AND r."tblId" = $parentTableId AND r."scopeId" = $scopeId
+LEFT JOIN "crdt_data_tombstone" d ON d."rowId" = r."id"
+WHERE p."scopeId" = $scopeId AND p."id" IN (${parentIds.sqlLiteralList()})
+  AND ($_rowVisible) AND (d."id" IS NULL OR d."clFlag" % 2 = 1)
+) = ${parentIds.length}''');
+    }
+    final encodedIds = {
+      for (final id in rowIds)
+        ValueEncoder.instance.encodeColumnValue(
+          CrdtDataAttemptedValue.t.value,
+          Protocol().dynamicFieldToJson(id),
+        ),
+    };
+    for (final MapEntry(key: childTable, value: columnNames)
+        in referencingColumnsByTable.entries) {
+      final predicates = [
+        for (final column in columnNames) '"${column.escapeIdentifier()}" IN ($ids)',
+      ].join(' OR ');
+      conditions.add(
+        'NOT EXISTS (SELECT 1 FROM "${childTable.escapeIdentifier()}" '
+        'WHERE $predicates)',
+      );
+      final (childTableId, columns) = schema[childTable]!;
+      final columnIds = {
+        for (final name in columnNames) ?columns[name]?.id,
+      };
+      if (columnIds.isEmpty) continue;
+      conditions.add('''NOT EXISTS (
+SELECT 1 FROM "crdt_data_attempted_value" a
+JOIN "crdt_data_fields" f ON f."id" = a."fieldId"
+JOIN "crdt_data_rows" r ON r."id" = f."rowId"
+WHERE r."scopeId" = $scopeId AND r."tblId" = $childTableId
+  AND f."columnId" IN (${columnIds.join(', ')})
+  AND a."value" IN (${encodedIds.join(', ')}))''');
+    }
+    for (final claims in uniqueClaims) {
+      final predicates = [
+        for (final MapEntry(key: column, value: values) in claims.entries)
+          '("${column.escapeIdentifier()}" IN (${values.sqlLiteralList()}))',
+      ].join(' AND ');
+      conditions.add(
+        'NOT EXISTS (SELECT 1 FROM "${tableName.escapeIdentifier()}" '
+        'WHERE $predicates AND "id" NOT IN ($ids))',
+      );
+    }
+    final result = await database.unsafeQuery(
+      'SELECT ${conditions.map((condition) => "($condition)").join(" AND ")}',
+      transaction: transaction,
+    );
+    final stable = result.single.first;
+    return stable == true || stable == 1;
+  }
+
   Future<void> upsertCrdtFieldsForRows(
     String tableName,
     List<CrdtDataRow> crdtDataRows,
@@ -157,66 +246,34 @@ class CrdtRecorderContext {
   }) async {
     if (crdtDataRows.isEmpty || schemaColumns.isEmpty) return;
 
-    final rowPks = crdtDataRows.map((r) => r.id!).toSet();
-    final columnPks = schemaColumns.map((c) => c.id!).toSet();
-    final existingFields = await CrdtDataField.db.find(
-      databaseSession,
-      where: (t) => t.rowId.inSet(rowPks) & t.columnId.inSet(columnPks),
-      transaction: transaction,
-    );
-
-    final fieldByRowAndColumn = {
-      for (final f in existingFields) (f.rowId, f.columnId): f,
-    };
-
     final hlcManager = hlcManagerFor(transaction);
-    final toInsert = <CrdtDataField>[];
-    final toUpdate = <CrdtDataField>[];
-
+    final fields = <CrdtDataField>[];
     for (final row in crdtDataRows) {
       for (final schemaCol in schemaColumns) {
         if (skippedFields.contains((tableName, row.uuidRowId, schemaCol.name))) {
           continue;
         }
-
         final hlc = hlcManager.increment();
-        final existing = fieldByRowAndColumn[(row.id!, schemaCol.id!)];
-        if (existing == null) {
-          toInsert.add(
-            CrdtDataField(
-              rowId: row.id!,
-              columnId: schemaCol.id!,
-              nodeId: hlcManager.normalizedNodeId,
-              hlcDatetime: hlc.datetime,
-              hlcCounter: hlc.counter,
-            ),
-          );
-        } else {
-          toUpdate.add(
-            existing.copyWith(
-              nodeId: hlcManager.normalizedNodeId,
-              hlcDatetime: hlc.datetime,
-              hlcCounter: hlc.counter,
-            ),
-          );
-        }
+        fields.add(
+          CrdtDataField(
+            rowId: row.id!,
+            columnId: schemaCol.id!,
+            nodeId: hlcManager.normalizedNodeId,
+            hlcDatetime: hlc.datetime,
+            hlcCounter: hlc.counter,
+          ),
+        );
       }
     }
-
-    if (toInsert.isNotEmpty) {
-      await CrdtDataField.db.insert(
-        databaseSession,
-        toInsert,
-        transaction: transaction,
-      );
-    }
-    if (toUpdate.isNotEmpty) {
-      await CrdtDataField.db.update(
-        databaseSession,
-        toUpdate,
-        transaction: transaction,
-      );
-    }
+    if (fields.isEmpty) return;
+    await CrdtDataField.db.upsert(
+      databaseSession,
+      fields,
+      conflictColumns: (t) => [t.rowId, t.columnId],
+      updateColumns: (t) => [t.nodeId, t.hlcDatetime, t.hlcCounter],
+      transaction: transaction,
+      noReturn: true,
+    );
   }
 
   Future<void> recordFieldsUpdatedByTable(

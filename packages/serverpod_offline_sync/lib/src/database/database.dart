@@ -201,6 +201,8 @@ class CrdtDatabase implements Database {
     Transaction? transaction, {
     required bool membershipWide,
   }) async {
+    if (include == null && !_recorder.isCrdtTracked<T>()) return where;
+
     final scopeIds = await _scopeIdsForQueries(
       transaction,
       membershipWide: membershipWide,
@@ -429,18 +431,18 @@ class CrdtDatabase implements Database {
       transaction,
       (tx) async {
         final prepared = _prepareRowsForInsert(rows, tx);
-        if (rows.isNotEmpty) {
-          final rowIds = {
-            for (final row in rows)
-              if (row.id case final UuidValue rowId) rowId,
-          };
-          await _recorder.projectCurrent(rows.first.table.tableName, rowIds, tx);
-        }
+        final values = _recorder.withForeignKeyInsertDefaults(prepared.rows);
+        final projectionUnchanged = await _recorder.prepareLocalUpsert(
+          values,
+          conflictColumns,
+          updateColumns,
+          tx,
+        );
 
         // CRDT metadata needs the affected rows even when the public call uses
         // noReturn, because inserted rows may have database-generated ids.
         final result = await _delegate.upsert<T>(
-          _recorder.withForeignKeyInsertDefaults(prepared.rows),
+          values,
           conflictColumns: conflictColumns,
           updateColumns: updateColumns,
           updateWhere: await _whereVisibleWithTombstone<T>(
@@ -469,7 +471,12 @@ class CrdtDatabase implements Database {
           for (final row in result)
             if (row.id is! UuidValue || !insertedRowIds.contains(row.id)) row,
         ];
-        await _recorder.afterUpdate(updatedRows, updateColumns, tx);
+        await _recorder.afterUpdate(
+          updatedRows,
+          updateColumns,
+          tx,
+          projectionUnchanged: projectionUnchanged,
+        );
         if (noReturn) return <T>[];
         _stripStampedRows(result, prepared);
         for (final row in reinsertedRows) {
@@ -519,7 +526,7 @@ class CrdtDatabase implements Database {
       transaction,
     );
     final reinsertedRows = await _delegate.update<T>(
-      plannedReinserts,
+      plannedReinserts.rows,
       transaction: transaction,
     );
     await _recorder.afterReinsert(reinsertedRows, transaction);
@@ -623,7 +630,7 @@ class CrdtDatabase implements Database {
       (tx) async {
         final plannedUpdates = await _recorder.planLocalUpdates(rows, columns, tx);
         final updatedRows = [
-          for (final row in plannedUpdates)
+          for (final row in plannedUpdates.rows)
             await _updateRowWithoutRecording(
               row,
               stripScopeId: _shouldStripReturnedScopeId(row, tx),
@@ -632,7 +639,12 @@ class CrdtDatabase implements Database {
             ),
         ];
 
-        await _recorder.afterUpdate(updatedRows, columns, tx);
+        await _recorder.afterUpdate(
+          updatedRows,
+          columns,
+          tx,
+          projectionUnchanged: plannedUpdates.projectionUnchanged,
+        );
         return noReturn ? <T>[] : updatedRows;
       },
     );
@@ -652,13 +664,18 @@ class CrdtDatabase implements Database {
         final plannedUpdates = await _recorder.planLocalUpdates([row], columns, tx);
         final stripScopeId = _shouldStripReturnedScopeId(row, tx);
         final updatedRow = await _updateRowWithoutRecording(
-          plannedUpdates.single,
+          plannedUpdates.rows.single,
           stripScopeId: stripScopeId,
           transaction: tx,
           columns: columns,
         );
 
-        await _recorder.afterUpdate([updatedRow], columns, tx);
+        await _recorder.afterUpdate(
+          [updatedRow],
+          columns,
+          tx,
+          projectionUnchanged: plannedUpdates.projectionUnchanged,
+        );
         return updatedRow;
       },
     );
@@ -980,9 +997,23 @@ class CrdtDatabase implements Database {
 
     // On the server this is authoritative membership; on a persistent client it
     // is the server-projected membership cache.
-    return _scopeIdsForUuids(
-      await CrdtScopeMembership.memberScopes(_delegate.session, userId),
-    );
+    final scopeGroups = await Future.wait<List<CrdtScope>>([
+      CrdtScope.db.find(
+        _delegate.session,
+        where: (t) => t.uuidScopeId.equals(userId),
+      ),
+      CrdtScopeMember.db
+          .find(
+            _delegate.session,
+            where: (t) => t.userUuid.equals(userId),
+            include: CrdtScopeMember.include(scope: CrdtScope.include()),
+          )
+          .then((memberships) => [for (final member in memberships) member.scope!]),
+    ]);
+    return {
+      for (final scopes in scopeGroups)
+        for (final scope in scopes) scope.id!,
+    }.toList();
   }
 
   List<int>? _actingScopeIdsForQueries(Transaction? transaction) {
@@ -996,18 +1027,6 @@ class CrdtDatabase implements Database {
       if (userId != null) return userId;
     }
     return _recorder.persistentUserId;
-  }
-
-  Future<List<int>> _scopeIdsForUuids(List<UuidValue> scopeUuids) async {
-    if (scopeUuids.isEmpty) return [];
-    final scopes = await CrdtScope.db.find(
-      _delegate.session,
-      where: (t) => t.uuidScopeId.inSet(scopeUuids.toSet()),
-    );
-    return [
-      for (final scope in scopes)
-        if (scope.id != null) scope.id!,
-    ];
   }
 
   Future<UuidValue> _requireUserId(UuidValue? userId) async {
