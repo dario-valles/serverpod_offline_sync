@@ -19,10 +19,14 @@ enum MergeOperation { insert, update, delete, mixed }
 
 enum FkChainOperation { insert, delete }
 
+enum SetDefaultOperation { originalDeleteOrRestore, defaultDeleteOrRestore }
+
 /// Measurement of a merge scenario, averaged over the timed merge batches.
 typedef MergeMeasurement = ({
   double averageMicroseconds,
   double averageQueries,
+  double averageRowsRead,
+  Map<String, double> averageRowsReadByType,
 });
 
 /// The number of changes of each kind in a mixed batch of [changeCount].
@@ -69,6 +73,8 @@ abstract class MergeScenarioBenchmark extends AsyncBenchmarkBase {
   CrdtMergeSet _mergeSet = [];
 
   int _timedQueries = 0;
+  int _timedRowsRead = 0;
+  final _timedRowsReadByType = <String, int>{};
   int _timedRuns = 0;
 
   /// Scenario title used in the results header, e.g. `INSERT`.
@@ -85,6 +91,9 @@ abstract class MergeScenarioBenchmark extends AsyncBenchmarkBase {
 
   /// Seeds state once after the session is created, before the first cycle.
   Future<void> onSetup() async {}
+
+  /// Checks that each measured change took effect, outside the timed merge.
+  Future<void> validateCycle() async {}
 
   Hlc _nextRemoteHlc() => _remoteHlc = _remoteHlc.increment();
 
@@ -149,6 +158,8 @@ abstract class MergeScenarioBenchmark extends AsyncBenchmarkBase {
     _valueSeq = 0;
     _mergeSet = [];
     _timedQueries = 0;
+    _timedRowsRead = 0;
+    _timedRowsReadByType.clear();
     _timedRuns = 0;
     final dbPath = p.join(
       Directory.systemTemp.path,
@@ -181,17 +192,26 @@ abstract class MergeScenarioBenchmark extends AsyncBenchmarkBase {
         _warmupMillis,
         prepare: prepareCycle,
         run: run,
+        validate: validateCycle,
       );
       _timedQueries = 0;
+      _timedRowsRead = 0;
+      _timedRowsReadByType.clear();
       _timedRuns = 0;
       final averageMicroseconds = await measurePreparedCycles(
         _measurementMillis,
         prepare: prepareCycle,
         run: run,
+        validate: validateCycle,
       );
       return (
         averageMicroseconds: averageMicroseconds,
         averageQueries: _timedQueries / _timedRuns,
+        averageRowsRead: _timedRowsRead / _timedRuns,
+        averageRowsReadByType: {
+          for (final entry in _timedRowsReadByType.entries)
+            entry.key: entry.value / _timedRuns,
+        },
       );
     } finally {
       await teardown();
@@ -201,8 +221,20 @@ abstract class MergeScenarioBenchmark extends AsyncBenchmarkBase {
   @override
   Future<void> run() async {
     final queriesBefore = _countingDb.queryCount;
+    final rowsBefore = _countingDb.rowsRead;
+    final rowsByTypeBefore = Map.of(_countingDb.rowsReadByType);
     await _crdtSession.db.mergeChanges(_mergeSet, scopeId: _userId);
     _timedQueries += _countingDb.queryCount - queriesBefore;
+    _timedRowsRead += _countingDb.rowsRead - rowsBefore;
+    for (final entry in _countingDb.rowsReadByType.entries) {
+      final count = entry.value - (rowsByTypeBefore[entry.key] ?? 0);
+      if (count == 0) continue;
+      _timedRowsReadByType.update(
+        entry.key,
+        (total) => total + count,
+        ifAbsent: () => count,
+      );
+    }
     _timedRuns++;
   }
 
@@ -511,3 +543,110 @@ typedef _FkChainFamily = ({
   FkChainRestrictBlocker restrictBlocker,
   List<TableRow<UuidValue?>> rows,
 });
+
+/// Measures SET DEFAULT projection with many independent town/company pairs.
+/// Compares deleting/restoring an original parent with changing the shared
+/// default target, which also requires looking up implicit dependencies.
+class SetDefaultMergeBenchmark extends MergeScenarioBenchmark {
+  SetDefaultMergeBenchmark(
+    super.name, {
+    required this.operation,
+    required this.pairCount,
+  }) {
+    if (pairCount < 1) {
+      throw ArgumentError.value(pairCount, 'pairCount', 'Must be >= 1');
+    }
+  }
+
+  static const _defaultTownId = UuidValue.raw('550e8400-e29b-41d4-a716-446655440000');
+
+  final SetDefaultOperation operation;
+  final int pairCount;
+  late List<Town> _towns;
+  late List<Company> _companies;
+  late Town _defaultTown;
+  var _cycle = 0;
+  var _visibilityFlag = 1;
+
+  @override
+  String get resultTitle =>
+      'SET DEFAULT ${switch (operation) {
+        SetDefaultOperation.originalDeleteOrRestore => 'ORIGINAL DELETE / RESTORE',
+        SetDefaultOperation.defaultDeleteOrRestore => 'DEFAULT DELETE / RESTORE',
+      }}';
+
+  @override
+  int get changesPerBatch => 1;
+
+  @override
+  String get batchDescription =>
+      '${formatter0.format(pairCount)} town/company pairs sharing one default';
+
+  @override
+  Future<void> onSetup() async {
+    _cycle = 0;
+    _visibilityFlag = 1;
+    _defaultTown = Town(id: _defaultTownId, name: 'default');
+    _towns = [
+      for (var i = 0; i < pairCount; i++)
+        Town(id: const Uuid().v7obj(), name: 'town $i'),
+    ];
+    _companies = [
+      for (var i = 0; i < pairCount; i++)
+        Company(id: const Uuid().v7obj(), name: 'company $i', townId: _towns[i].id),
+    ];
+    await mergeSeedRows([
+      _defaultTown,
+      ..._towns,
+      ..._companies,
+    ]);
+  }
+
+  bool get _alternate => _cycle.isOdd;
+
+  Town get _changedTown => switch (operation) {
+    SetDefaultOperation.originalDeleteOrRestore => _towns.first,
+    SetDefaultOperation.defaultDeleteOrRestore => _defaultTown,
+  };
+
+  UuidValue get _expectedTownId =>
+      operation == SetDefaultOperation.originalDeleteOrRestore && _alternate
+      ? _defaultTownId
+      : _towns.first.id!;
+
+  @override
+  Future<void> prepareCycle() async {
+    _cycle++;
+    _mergeSet = [_visibilityChange(_changedTown)];
+  }
+
+  CrdtMergeDelete _visibilityChange(Town town) {
+    final hlc = _nextRemoteHlc();
+    // HLC advancement alone cannot supersede a higher visibility flag. Advance
+    // both on every delete/restore so no measured cycle becomes a stale no-op.
+    return CrdtMergeDelete(
+      uuidScopeId: _userId,
+      tableName: Town.t.tableName,
+      uuidRowId: town.id!,
+      uuidNodeId: hlc.nodeId,
+      hlcDatetime: hlc.datetime,
+      hlcCounter: hlc.counter,
+      clFlag: ++_visibilityFlag,
+      reason: _alternate
+          ? CrdtDataDeletedReason.userDelete
+          : CrdtDataDeletedReason.userReinsert,
+    );
+  }
+
+  @override
+  Future<void> validateCycle() async {
+    final company = await Company.db.findById(_crdtSession, _companies.first.id!);
+    if (company == null || company.townId != _expectedTownId) {
+      throw StateError('$name cycle $_cycle did not project the company as expected.');
+    }
+    final visibleTown = await Town.db.findById(_crdtSession, _changedTown.id!);
+    if ((visibleTown == null) != _alternate) {
+      throw StateError('$name cycle $_cycle did not apply its visibility change.');
+    }
+  }
+}

@@ -168,6 +168,12 @@ Future<void> main(List<String> args) async {
         changeCount: rowCount,
       ),
     UniqueMergeBenchmark('merge (unique conflict)', changeCount: rowCount),
+    for (final operation in SetDefaultOperation.values)
+      SetDefaultMergeBenchmark(
+        'merge (set default ${operation.name})',
+        operation: operation,
+        pairCount: rowCount < 1 ? 1 : rowCount,
+      ),
     for (final operation in FkChainOperation.values)
       FkChainMergeBenchmark(
         'merge (fk chain ${operation.name})',
@@ -189,6 +195,8 @@ Future<void> main(List<String> args) async {
         batchDescription: benchmark.batchDescription,
         average: mergeResult.averageMicroseconds,
         averageQueries: mergeResult.averageQueries,
+        averageRowsRead: mergeResult.averageRowsRead,
+        averageRowsReadByType: mergeResult.averageRowsReadByType,
         changeCount: benchmark.changesPerBatch,
       ),
       runningInCI: runningInCI,

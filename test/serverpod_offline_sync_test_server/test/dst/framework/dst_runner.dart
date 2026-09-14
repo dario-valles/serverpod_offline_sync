@@ -55,6 +55,8 @@ class DstRunReport {
     required this.rejected,
     required this.visibleRows,
     required this.hiddenRows,
+    required this.appliedPaths,
+    required this.attemptedPaths,
   });
 
   /// The seed that produced the run.
@@ -75,15 +77,18 @@ class DstRunReport {
   /// Hidden rows at quiescence, summed across replicas.
   final int hiddenRows;
 
+  final Map<String, int> appliedPaths;
+  final Map<String, int> attemptedPaths;
+
   @override
   String toString() =>
       'seed=$seed merges=$merges applied=$applied rejected=$rejected '
-      'visible=$visibleRows hidden=$hiddenRows';
+      'visible=$visibleRows hidden=$hiddenRows paths=$appliedPaths';
 }
 
 /// Runs one seeded simulation and checks every property.
 ///
-/// Structural invariants run after each merge, so a violation is reported at
+/// Structural invariants run after each local commit and merge, so a violation is reported at
 /// the moment it appears rather than at the end of the run. Agreement
 /// properties run once, after the adversary has quiesced.
 Future<DstRunReport> runDstSimulation({
@@ -116,6 +121,11 @@ Future<DstRunReport> runDstSimulation({
     );
   }
 
+  // company.townId repairs onto this well-known town. Inserted once, in one
+  // scope, because row ids are globally unique; other scopes exercise the
+  // unrepairable set-default path instead.
+  await replicas.first.seedDefaultTown(replicas.first.scopeUuids.first);
+
   final operations = DstOperations(random, ids);
   final adversary = DstAdversary(random, replicas);
   var applied = 0;
@@ -131,6 +141,7 @@ Future<DstRunReport> runDstSimulation({
     if (violations.isEmpty) return;
     throw DstPropertyFailure(
       seed: seed,
+      rounds: rounds,
       replica: replica,
       violations: violations,
     );
@@ -141,7 +152,10 @@ Future<DstRunReport> runDstSimulation({
       final scopeUuid = random.pickOrNull(replica.scopeUuids);
       if (scopeUuid == null) continue;
       final outcome = await operations.step(replica, scopeUuid);
-      if (outcome == DstOperationOutcome.applied) applied++;
+      if (outcome == DstOperationOutcome.applied) {
+        applied++;
+        await checkInvariants(replica);
+      }
       simulationClock.advance(Duration(milliseconds: random.between(1, 40)));
     }
     await adversary.step(checkInvariants);
@@ -174,7 +188,7 @@ Future<DstRunReport> runDstSimulation({
     );
   }
   if (violations.isNotEmpty) {
-    throw DstPropertyFailure(seed: seed, violations: violations);
+    throw DstPropertyFailure(seed: seed, rounds: rounds, violations: violations);
   }
 
   return DstRunReport(
@@ -186,6 +200,8 @@ Future<DstRunReport> runDstSimulation({
       0,
       (sum, snapshot) => sum + snapshot.visibleRowCount,
     ),
+    appliedPaths: Map.unmodifiable(operations.appliedPaths),
+    attemptedPaths: Map.unmodifiable(operations.attemptedPaths),
     hiddenRows: snapshots.values.fold(
       0,
       (sum, snapshot) => sum + snapshot.hiddenRowCount,
@@ -203,6 +219,7 @@ Future<DstRunReport> runDstSimulation({
 Future<T> runWithSeedReported<T>({
   required int index,
   required int seed,
+  required int rounds,
   required Future<T> Function() run,
 }) async {
   try {
@@ -213,7 +230,7 @@ Future<T> runWithSeedReported<T>({
     Error.throwWithStackTrace(
       StateError(
         'Simulation $index (seed $seed) failed\n'
-        'Replay: DST_SEED_BASE=$seed DST_SEEDS=1 dart test -P dst\n'
+        'Replay: DST_SEED_BASE=$seed DST_SEEDS=1 DST_ROUNDS=$rounds dart test -P dst\n'
         '$error',
       ),
       stackTrace,
@@ -229,12 +246,16 @@ class DstPropertyFailure implements Exception {
   /// Creates a failure for [seed].
   DstPropertyFailure({
     required this.seed,
+    required this.rounds,
     required this.violations,
     this.replica,
   });
 
   /// The seed that produced the failure.
   final int seed;
+
+  /// The round count that produced the failure.
+  final int rounds;
 
   /// The violated properties.
   final List<DstViolation> violations;
@@ -246,7 +267,9 @@ class DstPropertyFailure implements Exception {
   String toString() {
     final buffer = StringBuffer()
       ..writeln('DST property failure (seed $seed)')
-      ..writeln('Replay: DST_SEED_BASE=$seed DST_SEEDS=1 dart test -P dst');
+      ..writeln(
+        'Replay: DST_SEED_BASE=$seed DST_SEEDS=1 DST_ROUNDS=$rounds dart test -P dst',
+      );
     if (replica != null) buffer.writeln('Replica: $replica');
     for (final violation in violations) {
       buffer.writeln('- ${violation.property}: ${violation.detail}');

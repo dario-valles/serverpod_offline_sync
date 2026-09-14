@@ -194,21 +194,36 @@ class CrdtForeignKeyProjector {
               transaction,
             );
           case ForeignKeyAction.setDefault:
-            final defaultValue = _context.defaultValueForColumn(
-              reference.childTableName,
-              reference.childColumn,
+            final edge = _foreignKeys.edgesByChildTable[reference.childTableName]!
+                .firstWhere((edge) => edge.childColumn == reference.childColumn);
+            final repair = await _defaultProjectionValueFromDatabase(
+              edge,
+              transaction,
             );
-            if (defaultValue == null) {
-              throw StateError(
-                'No default value found for '
-                '${reference.childTableName}.${reference.childColumn}.',
+            // Soft deletion leaves the physical target in place, so the SQL
+            // FK cannot reject a hidden or cross-scope default for us. A target
+            // in this delete batch is still visible now but cannot be a repair.
+            final deletesDefault =
+                repair.value != null &&
+                (reference.parentColumn == 'id'
+                    ? parentIds.contains(repair.value)
+                    : parentValuesById!.values.any(
+                        (values) =>
+                            values[reference.parentColumn].toUuidValue() ==
+                            repair.value,
+                      ));
+            if (!repair.valid || deletesDefault) {
+              throw Exception(
+                'Cannot delete $parentTableName row because '
+                '${reference.childTableName}.${reference.childColumn} '
+                'has no legal set-default target.',
               );
             }
             await _updateChildColumnTo(
               reference.childTableName,
               childIds,
               reference.childColumn,
-              defaultValue,
+              repair.value,
               transaction,
             );
           case ForeignKeyAction.cascade:
@@ -1056,6 +1071,10 @@ class CrdtForeignKeyProjector {
 
   /// Loads the rows the seeds can reach instead of every row of their tables.
   ///
+  /// Defaults are loaded as evaluation context. Their implicit dependents join
+  /// only when the default itself or its possible visibility is affected, not
+  /// merely because an unrelated child needs to inspect its fallback.
+  ///
   /// Cascade, restrict and repair all travel along foreign key edges, and a
   /// row reached by no edge from a seed cannot change, so the closure is the
   /// seeds plus their foreign key component: children of a loaded row, because
@@ -1102,47 +1121,281 @@ class CrdtForeignKeyProjector {
       enqueue(rowKey.$1, [rowKey.$2]);
       (frontier[rowKey.$1] ??= <UuidValue>{}).add(rowKey.$2);
     }
-    await _enqueueSetDefaultTargets(
-      tablesToLoad: tablesToLoad,
-      enqueue: enqueue,
-      transaction: transaction,
-    );
+    final defaultEdges = [
+      for (final edge in _foreignKeys.edges)
+        if (edge.action == ForeignKeyAction.setDefault &&
+            edge.defaultValue.toUuidValue() != null &&
+            tablesToLoad.contains(edge.childTableName))
+          edge,
+    ];
+    await _enqueueSetDefaultTargets(defaultEdges, enqueue, transaction);
 
-    while (queued.isNotEmpty || frontier.isNotEmpty) {
-      final wave = queued;
-      queued = <String, Set<UuidValue>>{};
+    final affectedSeeds = {...seedRows, ...unwrittenValues.keys};
+    final expandedDefaults = <ForeignKeyEdge>{};
+    while (true) {
+      while (queued.isNotEmpty || frontier.isNotEmpty) {
+        final wave = queued;
+        queued = <String, Set<UuidValue>>{};
 
-      final loadedNow = <String, Set<UuidValue>>{};
-      for (final MapEntry(key: tableName, value: ids) in wave.entries) {
-        final loaded = await _loadTableRowsInto(
-          tableName: tableName,
-          rowIds: ids,
-          columnNames: columnsByTable[tableName] ?? const <String>{},
+        final loadedNow = <String, Set<UuidValue>>{};
+        for (final MapEntry(key: tableName, value: ids) in wave.entries) {
+          final loaded = await _loadTableRowsInto(
+            tableName: tableName,
+            rowIds: ids,
+            columnNames: columnsByTable[tableName] ?? const <String>{},
+            rows: rows,
+            fieldIds: fieldIds,
+            attemptedValues: attemptedValues,
+            fieldHlcs: fieldHlcs,
+            transaction: transaction,
+          );
+          if (loaded.isNotEmpty) loadedNow[tableName] = loaded;
+        }
+
+        for (final MapEntry(key: tableName, value: ids) in frontier.entries) {
+          (loadedNow[tableName] ??= <UuidValue>{}).addAll(ids);
+        }
+        frontier.clear();
+        if (loadedNow.isEmpty) break;
+
+        await _expandRowClosure(
+          loadedNow: loadedNow,
+          tablesToLoad: tablesToLoad,
           rows: rows,
-          fieldIds: fieldIds,
+          unwrittenValues: unwrittenValues,
           attemptedValues: attemptedValues,
-          fieldHlcs: fieldHlcs,
+          enqueue: enqueue,
           transaction: transaction,
         );
-        if (loaded.isNotEmpty) loadedNow[tableName] = loaded;
       }
 
-      for (final MapEntry(key: tableName, value: ids) in frontier.entries) {
-        (loadedNow[tableName] ??= <UuidValue>{}).addAll(ids);
-      }
-      frontier.clear();
-      if (loadedNow.isEmpty) break;
-
-      await _expandRowClosure(
-        loadedNow: loadedNow,
-        tablesToLoad: tablesToLoad,
+      if (expandedDefaults.length == defaultEdges.length) break;
+      final defaultsToExpand = _affectedDefaults(
+        defaultEdges: defaultEdges,
+        expandedDefaults: expandedDefaults,
+        affectedSeeds: affectedSeeds,
         rows: rows,
         unwrittenValues: unwrittenValues,
         attemptedValues: attemptedValues,
-        enqueue: enqueue,
-        transaction: transaction,
+        pendingInserts: pendingInserts,
+      );
+      if (defaultsToExpand.isEmpty) break;
+      for (final edge in defaultsToExpand) {
+        expandedDefaults.add(edge);
+        final dependents = await _findSetDefaultDependents(edge, transaction);
+        affectedSeeds.addAll(dependents);
+        for (final key in dependents) {
+          enqueue(key.$1, [key.$2]);
+        }
+      }
+    }
+  }
+
+  Future<void> _enqueueSetDefaultTargets(
+    List<ForeignKeyEdge> defaultEdges,
+    void Function(String, Iterable<UuidValue>) enqueue,
+    Transaction transaction,
+  ) async {
+    for (final edge in defaultEdges) {
+      await _enqueueParentRowsByValue(
+        edge,
+        {edge.defaultValue.toUuidValue()!},
+        enqueue,
+        transaction,
       );
     }
+  }
+
+  /// A fallback matters to children whose authored parent can be hidden or
+  /// missing, or whose FK already has a projection override. Seed those sparse
+  /// states and their cascade roots, then use the normal indexed reference walk.
+  Future<Set<MergeRowKey>> _findSetDefaultDependents(
+    ForeignKeyEdge edge,
+    Transaction transaction,
+  ) async {
+    final ancestors = <String>{edge.parentTableName};
+    final pendingTables = [edge.parentTableName];
+    while (pendingTables.isNotEmpty) {
+      final table = pendingTables.removeLast();
+      for (final parentEdge
+          in _foreignKeys.edgesByChildTable[table] ?? <ForeignKeyEdge>[]) {
+        if (parentEdge.action == ForeignKeyAction.cascade &&
+            ancestors.add(parentEdge.parentTableName)) {
+          pendingTables.add(parentEdge.parentTableName);
+        }
+      }
+    }
+    return _context.findSetDefaultDependencyRows(
+      ancestorTableNames: ancestors,
+      childTableName: edge.childTableName,
+      childColumn: edge.childColumn,
+      transaction: transaction,
+    );
+  }
+
+  /// Defaults whose implicit outgoing dependencies may have changed.
+  ///
+  /// A projected C -> D is not an authored edge: if C still wants A, restoring
+  /// A does not change D's deletion blockers. Following that projected edge
+  /// here would invalidate every unrelated default consumer on ordinary merges.
+  /// The stored authored reference and any new overlay do both participate.
+  Set<ForeignKeyEdge> _affectedDefaults({
+    required List<ForeignKeyEdge> defaultEdges,
+    required Set<ForeignKeyEdge> expandedDefaults,
+    required Set<MergeRowKey> affectedSeeds,
+    required Map<MergeRowKey, _ProjectedForeignKeyRow> rows,
+    required Map<MergeRowKey, Map<String, Object?>> unwrittenValues,
+    required Map<MergeFieldKey, CrdtDataAttemptedValue> attemptedValues,
+    required List<PendingProjectionRow> pendingInserts,
+  }) {
+    Set<UuidValue> references(
+      MergeRowKey key,
+      String column, {
+      bool includeProjected = false,
+    }) {
+      if (column == 'id') return {key.$2};
+      final attempted = attemptedValues[(key.$1, key.$2, column)];
+      return {
+        if (attempted != null) ?tryUuidValue(attempted.value),
+        if (attempted == null || includeProjected)
+          ?tryUuidValue(rows[key]?.values[column]),
+        ?tryUuidValue(unwrittenValues[key]?[column]),
+      };
+    }
+
+    // A live default with no authored parents cannot change visibility unless
+    // it is changed directly or already has a delete tombstone to arbitrate.
+    // Most defaults are standalone rows, so ordinary FK writes avoid even the
+    // in-memory dependency walk. A missing default also stays missing until an
+    // insert of that key seeds the pass. Non-PK references use the general walk
+    // because a different row can gain or lose the referenced value.
+    final mayChangeDefault = defaultEdges.any((edge) {
+      if (expandedDefaults.contains(edge)) return false;
+      if (edge.parentColumn != 'id') return true;
+      final key = (edge.parentTableName, edge.defaultValue.toUuidValue()!);
+      if (affectedSeeds.contains(key)) return true;
+      final row = rows[key];
+      if (row == null) return false;
+      if (row.crdtRow.isHidden || (row.crdtRow.deleted?.isDeleted ?? false)) {
+        return true;
+      }
+      return (_foreignKeys.edgesByChildTable[key.$1] ?? <ForeignKeyEdge>[]).any(
+        (parentEdge) => references(key, parentEdge.childColumn).isNotEmpty,
+      );
+    });
+    if (!mayChangeDefault) return {};
+
+    final graph = _buildDefaultDependencyGraph(
+      rows: rows,
+      unwrittenValues: unwrittenValues,
+      pendingInserts: pendingInserts,
+      references: references,
+    );
+
+    // This is deliberately an overapproximation: a restrict or nullable edge
+    // may keep its child visible. The important fast path is a live default
+    // with no possible deletion/missing-parent cause, which cannot change its
+    // visibility merely because an authored child reference changes.
+    final hiddenCandidates = _reachableRows(
+      graph.possiblyHidden,
+      graph.childrenByParent,
+    );
+    final affected = _reachableRows(affectedSeeds, graph.neighbors);
+    return {
+      for (final edge in defaultEdges)
+        if (!expandedDefaults.contains(edge))
+          for (final key in affected)
+            if (key.$1 == edge.parentTableName &&
+                references(
+                  key,
+                  edge.parentColumn,
+                  includeProjected: true,
+                ).contains(edge.defaultValue.toUuidValue()) &&
+                (affectedSeeds.contains(key) || hiddenCandidates.contains(key)))
+              edge,
+    };
+  }
+
+  /// Builds authored dependency edges; projected values only identify parents.
+  /// Keep this distinct from the stored-value walk in [_expandRowClosure].
+  _DefaultDependencyGraph _buildDefaultDependencyGraph({
+    required Map<MergeRowKey, _ProjectedForeignKeyRow> rows,
+    required Map<MergeRowKey, Map<String, Object?>> unwrittenValues,
+    required List<PendingProjectionRow> pendingInserts,
+    required Set<UuidValue> Function(
+      MergeRowKey key,
+      String column, {
+      bool includeProjected,
+    })
+    references,
+  }) {
+    final keys = {...rows.keys, ...unwrittenValues.keys};
+    final keysByTable = <String, List<MergeRowKey>>{};
+    for (final key in keys) {
+      keysByTable.putIfAbsent(key.$1, () => []).add(key);
+    }
+    final neighbors = <MergeRowKey, Set<MergeRowKey>>{};
+    final childrenByParent = <MergeRowKey, Set<MergeRowKey>>{};
+    final possiblyHidden = <MergeRowKey>{
+      for (final row in rows.values)
+        if (row.crdtRow.isHidden || (row.crdtRow.deleted?.isDeleted ?? false)) row.key,
+      for (final pending in pendingInserts)
+        if (pending.hidden) (pending.tableName, pending.rowId),
+    };
+    for (final edge in _foreignKeys.edges) {
+      final children = keysByTable[edge.childTableName];
+      if (children == null) continue;
+      final parents = <UuidValue, Set<MergeRowKey>>{};
+      for (final key in keysByTable[edge.parentTableName] ?? <MergeRowKey>[]) {
+        for (final value in references(
+          key,
+          edge.parentColumn,
+          includeProjected: true,
+        )) {
+          parents.putIfAbsent(value, () => {}).add(key);
+        }
+      }
+      for (final child in children) {
+        for (final reference in references(child, edge.childColumn)) {
+          final targets = parents[reference];
+          if (targets == null) {
+            // Missing parents can hide a default too, without a tombstone.
+            possiblyHidden.add(child);
+            continue;
+          }
+          for (final parent in targets) {
+            neighbors.putIfAbsent(child, () => {}).add(parent);
+            neighbors.putIfAbsent(parent, () => {}).add(child);
+            childrenByParent.putIfAbsent(parent, () => {}).add(child);
+            if (edge.parentColumn != 'id' &&
+                (unwrittenValues[parent]?.containsKey(edge.parentColumn) ?? false)) {
+              // Changing a referenced unique value can remove its old target.
+              possiblyHidden.add(child);
+            }
+          }
+        }
+      }
+    }
+
+    return (
+      neighbors: neighbors,
+      childrenByParent: childrenByParent,
+      possiblyHidden: possiblyHidden,
+    );
+  }
+
+  static Set<MergeRowKey> _reachableRows(
+    Set<MergeRowKey> seeds,
+    Map<MergeRowKey, Set<MergeRowKey>> graph,
+  ) {
+    final reached = {...seeds};
+    final queue = seeds.toList();
+    for (var index = 0; index < queue.length; index++) {
+      for (final key in graph[queue[index]] ?? <MergeRowKey>{}) {
+        if (reached.add(key)) queue.add(key);
+      }
+    }
+    return reached;
   }
 
   /// The values the pass will write but has not written yet, by row.
@@ -1165,35 +1418,6 @@ class CrdtForeignKeyProjector {
       )[fieldKey.$3] = value;
     }
     return unwrittenValues;
-  }
-
-  /// Enqueues the rows a set-default repair would fall back to.
-  ///
-  /// A set-default edge names its target in the schema, so no row points at it
-  /// until the repair runs and no edge query would reach it.
-  Future<void> _enqueueSetDefaultTargets({
-    required Set<String> tablesToLoad,
-    required void Function(String tableName, Iterable<UuidValue> ids) enqueue,
-    required Transaction transaction,
-  }) async {
-    for (final edge in _foreignKeys.edges) {
-      if (!tablesToLoad.contains(edge.childTableName)) continue;
-      final defaultValue = edge.defaultValue.toUuidValue();
-      if (defaultValue == null) continue;
-      if (edge.parentColumn == 'id') {
-        enqueue(edge.parentTableName, [defaultValue]);
-        continue;
-      }
-      enqueue(
-        edge.parentTableName,
-        await _context.findDomainRowIdsWhereColumnIn(
-          tableName: edge.parentTableName,
-          columnName: edge.parentColumn,
-          values: {defaultValue},
-          transaction: transaction,
-        ),
-      );
-    }
   }
 
   Future<void> _expandRowClosure({
@@ -1317,6 +1541,15 @@ class CrdtForeignKeyProjector {
     }
     if (references.isEmpty) return;
 
+    await _enqueueParentRowsByValue(edge, references, enqueue, transaction);
+  }
+
+  Future<void> _enqueueParentRowsByValue(
+    ForeignKeyEdge edge,
+    Set<UuidValue> references,
+    void Function(String, Iterable<UuidValue>) enqueue,
+    Transaction transaction,
+  ) async {
     if (edge.parentColumn == 'id') {
       enqueue(edge.parentTableName, references);
       return;
@@ -1488,6 +1721,10 @@ class CrdtForeignKeyProjector {
     _ForeignKeyProjectionState state,
     Set<MergeRowKey> userHidden,
   ) {
+    // Restart from authored deletions, never the previous projected winners.
+    // Each round withdraws all blocked roots together and never reintroduces
+    // them within this pass. This terminates even with circular dependencies;
+    // a later pass with the same facts makes exactly the same withdrawals.
     final acceptedRoots = userHidden.toSet();
 
     while (true) {
@@ -1949,8 +2186,10 @@ class CrdtForeignKeyProjector {
     final parkUpdates = <MergeRowKey, Map<String, Object?>>{};
     for (final MapEntry(key: rowKey, value: updates) in changed.entries) {
       final park = <String, Object?>{};
-      for (final column in _uniqueResolver.uniqueReleaseColumnsFor(rowKey.$1)) {
-        if (!updates.containsKey(column.columnName)) continue;
+      for (final column in _uniqueResolver.uniqueReleaseColumnsFor(
+        rowKey.$1,
+        updates.keys.toSet(),
+      )) {
         park[column.columnName] = _context.conflictFreeValue(
           column,
           originalDomain[rowKey]?[column.columnName],
@@ -1958,6 +2197,10 @@ class CrdtForeignKeyProjector {
           rowKey.$2,
           'park',
         );
+        // A discriminator-only change still moves the unique tuple. Restore
+        // its temporarily parked release column even if its final value did
+        // not change.
+        updates[column.columnName] = finalDomain[rowKey]![column.columnName];
       }
       if (park.isNotEmpty) parkUpdates[rowKey] = park;
     }
@@ -2346,3 +2589,9 @@ class CrdtForeignKeyProjector {
     }
   }
 }
+
+typedef _DefaultDependencyGraph = ({
+  Map<MergeRowKey, Set<MergeRowKey>> neighbors,
+  Map<MergeRowKey, Set<MergeRowKey>> childrenByParent,
+  Set<MergeRowKey> possiblyHidden,
+});
