@@ -296,6 +296,61 @@ void main() {
       expect(violations.map((v) => v.property), ['acceptedVisibility']);
     },
   );
+
+  for (final result in ['unchanged', 'wrong parity', 'old clock', 'accepted']) {
+    test(
+      'Given an accepted city deletion and a requested restore, '
+      'when a detector checks the $result restore snapshot, '
+      'then authoring evidence ${result == 'accepted' ? 'accepts the new odd generation and clock' : 'rejects the missing restore progress'}.',
+      () async {
+        final ids = DstIds(DstRandom(96));
+        final space = ids.next();
+        final replica = await _replica(ids, [space]);
+        final city = City(id: ids.next(), name: 'restored');
+        await replica.withReplicaClock(
+          () => replica.session.db.transactionForUser(space, (tx) async {
+            await City.db.insertRow(replica.session, city, transaction: tx);
+            await City.db.deleteRow(replica.session, city, transaction: tx);
+          }),
+        );
+        final before = await DstSnapshot.capture(replica);
+        final evidence = DstWriteEvidence(before)
+          ..visibility('city', [city.id!], deleted: false);
+        await replica.withReplicaClock(
+          () => replica.session.db.transactionForUser(
+            space,
+            (tx) => City.db.insertRow(replica.session, city, transaction: tx),
+          ),
+        );
+        final after = await DstSnapshot.capture(replica);
+        final key = 'city/${city.id}';
+        final restored = after.tombstones[key]!;
+        final tombstone = (
+          hlc: result == 'old clock' ? before.tombstones[key]!.hlc : restored.hlc,
+          clFlag: result == 'wrong parity' ? restored.clFlag + 1 : restored.clFlag,
+          reason: restored.reason,
+        );
+        // Corrupt only the detector input; persisted restore facts stay intact.
+        final candidate = result == 'unchanged'
+            ? before
+            : DstSnapshot(
+                rows: after.rows,
+                projections: after.projections,
+                causalLengths: after.causalLengths,
+                rowHlcs: after.rowHlcs,
+                fieldHlcs: after.fieldHlcs,
+                tombstones: {...after.tombstones, key: tombstone},
+              );
+
+        final violations = evidence.validate(candidate);
+
+        expect(
+          violations.map((v) => v.property),
+          result == 'accepted' ? isEmpty : ['acceptedVisibility'],
+        );
+      },
+    );
+  }
 }
 
 Future<DstReplica> _replica(DstIds ids, List<UuidValue> spaces) => DstReplica.create(
