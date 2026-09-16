@@ -707,6 +707,30 @@ class DstOperations {
         throw StateError('No generated value for ${table.tableName}.${column.name}');
       }
     }
+    // A visible-row upsert supplies every model field, so persisted defaults
+    // also apply to null fields that this operation did not choose to change.
+    // Keep those defaults when legal; otherwise supply a real space-local
+    // parent, just as for a newly generated FK above.
+    if (insertDefaults) {
+      for (final edge in dstForeignKeys.where(
+        (edge) =>
+            edge.child == table &&
+            edge.defaultValue != null &&
+            !changed.contains(edge.column) &&
+            data[edge.column] == null,
+      )) {
+        final parents = await edge.parent.model.find(
+          session,
+          transaction: tx,
+          spaceUuid: spaceUuid,
+        );
+        if (parents.any((row) => row.id == edge.defaultValue)) continue;
+        final parent = random.pickOrNull(parents);
+        if (parent == null) return null;
+        data[edge.column] =
+            (parent.toJson() as Map<String, dynamic>)[edge.parentColumn];
+      }
+    }
     return table.model.fromJson(data);
   }
 

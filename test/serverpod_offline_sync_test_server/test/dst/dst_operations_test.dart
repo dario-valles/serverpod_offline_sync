@@ -434,6 +434,129 @@ void main() {
       expect((insert.data as Town).mayorId, mayor.id);
     },
   );
+
+  for (final defaultLocation in ['missing', 'another space', 'the acting space']) {
+    final defaultDescription = defaultLocation == 'missing'
+        ? 'no default target'
+        : 'a default target in $defaultLocation';
+    test(
+      'Given a detached defaulted FK with a local parent and $defaultDescription, '
+      'when the DST upserts an unrelated field, '
+      'then the submitted reference resolves to a visible parent in the acting space.',
+      () async {
+        final ids = DstIds(DstRandom(910));
+        final space = ids.next();
+        final otherSpace = ids.next();
+        final replica = await DstReplica.create(
+          name: 'replica',
+          spaceUuids: [space, otherSpace],
+          nodeUuid: ids.next(),
+          clock: DstClock().clock,
+        );
+        if (defaultLocation != 'missing') {
+          await replica.seedDefaultTown(
+            defaultLocation == 'the acting space' ? space : otherSpace,
+          );
+        }
+        final parent = Town(id: ids.next(), name: 'available-parent');
+        final child = UniqueSetDefaultChild(
+          id: ids.next(),
+          name: 'original',
+          parentId: parent.id,
+        );
+        await replica.withReplicaClock(
+          () => replica.session.db.transactionForUser(space, (tx) async {
+            await Town.db.insertRow(replica.session, parent, transaction: tx);
+            await UniqueSetDefaultChild.db.insertRow(
+              replica.session,
+              child,
+              transaction: tx,
+            );
+            await UniqueSetDefaultChild.db.updateRow(
+              replica.session,
+              child.copyWith(parentId: null),
+              columns: (t) => [t.parentId],
+              transaction: tx,
+            );
+          }),
+        );
+        // This seed changes only name, leaving the full-row upsert to apply
+        // the unchanged null FK's persisted default.
+        final operations = DstOperations(DstRandom(5), ids);
+
+        final outcome = await operations.apply(
+          replica,
+          space,
+          table: DstTable.uniqueSetDefaultChild,
+          action: DstAction.upsert,
+        );
+
+        expect(outcome, DstOperationOutcome.applied);
+        final updated = (await UniqueSetDefaultChild.db.findById(
+          replica.session,
+          child.id!,
+        ))!;
+        expect(updated.name, isNot(child.name));
+        expect(
+          updated.parentId,
+          defaultLocation == 'the acting space' ? dstDefaultTownId : parent.id,
+        );
+        expect(operations.rejections, isEmpty);
+      },
+    );
+  }
+
+  test(
+    'Given a detached defaulted FK with no visible parent or default target, '
+    'when the DST tries to upsert an unrelated field, '
+    'then it skips the unavailable reference without changing authored facts.',
+    () async {
+      final ids = DstIds(DstRandom(910));
+      final space = ids.next();
+      final replica = await _replica(ids, space);
+      final parent = Town(id: ids.next(), name: 'removed-parent');
+      final child = UniqueSetDefaultChild(
+        id: ids.next(),
+        name: 'original',
+        parentId: parent.id,
+      );
+      await replica.withReplicaClock(
+        () => replica.session.db.transactionForUser(space, (tx) async {
+          await Town.db.insertRow(replica.session, parent, transaction: tx);
+          await UniqueSetDefaultChild.db.insertRow(
+            replica.session,
+            child,
+            transaction: tx,
+          );
+          await UniqueSetDefaultChild.db.updateRow(
+            replica.session,
+            child.copyWith(parentId: null),
+            columns: (t) => [t.parentId],
+            transaction: tx,
+          );
+          await Town.db.deleteRow(replica.session, parent, transaction: tx);
+        }),
+      );
+      final before = (await replica.collect(space)).map(dstChangeKey).toSet();
+      final operations = DstOperations(DstRandom(5), ids);
+
+      final outcome = await operations.apply(
+        replica,
+        space,
+        table: DstTable.uniqueSetDefaultChild,
+        action: DstAction.upsert,
+      );
+
+      expect(outcome, DstOperationOutcome.skipped);
+      expect((await replica.collect(space)).map(dstChangeKey).toSet(), before);
+      final retained = (await UniqueSetDefaultChild.db.findById(
+        replica.session,
+        child.id!,
+      ))!;
+      expect(retained.name, child.name);
+      expect(retained.parentId, isNull);
+    },
+  );
 }
 
 DstAction _action(String name) =>
