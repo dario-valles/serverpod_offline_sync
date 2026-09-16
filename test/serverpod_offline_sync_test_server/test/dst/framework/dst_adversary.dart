@@ -101,7 +101,7 @@ class DstAdversary {
     for (var pass = 0; pass < _maxQuiescePasses; pass++) {
       for (final replica in replicas) {
         for (final spaceUuid in replica.spaceUuids) {
-          await _collect(replica, spaceUuid);
+          await _collect(replica, spaceUuid, allowResend: false);
         }
       }
       if (_pending.isEmpty) return;
@@ -136,7 +136,11 @@ class DstAdversary {
 
   /// Collects [source]'s changes for [spaceUuid] and queues them for every
   /// other replica that holds the space.
-  Future<void> _collect(DstReplica source, UuidValue spaceUuid) async {
+  Future<void> _collect(
+    DstReplica source,
+    UuidValue spaceUuid, {
+    bool allowResend = true,
+  }) async {
     final changes = await source.collect(spaceUuid);
     if (changes.isEmpty) return;
 
@@ -147,7 +151,9 @@ class DstAdversary {
       final delivered = _deliveredKeys.putIfAbsent(target.name, () => {});
       // Occasionally resend what the target already merged. Redelivery must be
       // a no-op, so this is the idempotence probe rather than wasted work.
-      final resend = random.chance(0.15);
+      // During quiescence only newly observed facts can keep the network busy;
+      // deliberate duplicates must not masquerade as merge-authored changes.
+      final resend = allowResend && random.chance(0.15);
       final fresh = resend
           ? changes
           : [

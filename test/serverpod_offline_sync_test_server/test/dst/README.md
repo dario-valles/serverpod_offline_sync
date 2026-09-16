@@ -116,6 +116,10 @@ that input arrives as a causally complete snapshot of the sender
 Delay, reorder, and redelivery are the honest moves - and redelivery is how
 idempotence gets probed.
 
+When the schedule ends, quiescence drains every pending batch and collects only
+facts a receiver has not yet seen. It stops introducing deliberate duplicates,
+so stable replicas cannot exhaust the convergence limit merely through resends.
+
 ## Layout
 
 | File | Role |
