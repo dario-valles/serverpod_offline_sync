@@ -183,7 +183,6 @@ attempted and committed counts by table/action so a passing run does not hide
 which paths it visited. Rejected local transactions remain separate from
 committed operations.
 
-
 ## Workload strength and metrics
 
 The populated profile creates every declared table and FK edge, closes the
@@ -217,7 +216,8 @@ previous 6,000 attempts spread across fifty shallow 20-round worlds. This keeps
 comparable attempt volume while exploring ten times the history depth and
 connected graphs. Each topology runs in its own sixty-minute CI job with four
 ten-minute per-seed ceilings; a failure in one job does not cancel the other.
-Both jobs also run the ownership-collision controls.
+Both jobs also run the ownership-collision controls. The local `melos test-dst`
+command runs both topologies together, so it covers the combined CI matrix.
 Known engine failures remain failures; CI is intentionally not a PR merge gate.
 
 ```sh

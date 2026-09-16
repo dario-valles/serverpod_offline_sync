@@ -112,6 +112,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # Keep the topology files below and shared ownership controls exhaustive
+        # when adding a new test file tagged dst.
         topology: [convergence, cross_space]
     steps:
       - uses: actions/checkout@v4
