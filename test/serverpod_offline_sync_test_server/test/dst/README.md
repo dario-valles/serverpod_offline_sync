@@ -86,6 +86,10 @@ Determinism requires every source of variation to come from the seed.
   node UUID, so an unpinned node id makes concurrent merge winners
   nondeterministic.
 
+Node UUIDs are assigned to replicas through a seeded permutation, independently
+of the ordered clock offsets. Seeds can therefore explore both directions of
+the HLC node tie-break while replaying the same assignment exactly.
+
 Node identity is currently pinned by pre-creating the `CrdtNode` row and
 attaching it to every space, which relies on how `OfflineSyncSpaceManager` resolves
 the current node. `DstReplica._assertSeededNodeIdentity` fails loudly if that

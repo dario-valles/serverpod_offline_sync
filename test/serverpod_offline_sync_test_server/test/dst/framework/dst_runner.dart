@@ -154,6 +154,8 @@ Future<DstRunReport> runDstSimulation({
     for (var index = 0; index < topology.spaceCount; index++) ids.next(),
   ];
 
+  // UUID minting order must not force HLC node tie-breaks to follow clock skew.
+  final nodeUuids = ids.nextShuffled(topology.replicaCount);
   final replicas = <DstReplica>[];
   for (var index = 0; index < topology.replicaCount; index++) {
     replicas.add(
@@ -163,7 +165,7 @@ Future<DstRunReport> runDstSimulation({
           for (final spaceIndex in topology.subscriptions[index])
             spaceUuids[spaceIndex],
         ],
-        nodeUuid: ids.next(),
+        nodeUuid: nodeUuids[index],
         // Skew stays far below Hlc's one-minute drift limit so the simulation
         // exercises clock disagreement without tripping ClockDriftException.
         clock: simulationClock.skewed(Duration(milliseconds: index * 250)),

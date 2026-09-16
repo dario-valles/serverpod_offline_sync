@@ -36,6 +36,9 @@ class DstRandom {
   /// A uniformly chosen element of [items], or null when it is empty.
   T? pickOrNull<T>(List<T> items) => items.isEmpty ? null : pick(items);
 
+  /// A seed-driven permutation without changing the caller's list.
+  List<T> shuffled<T>(Iterable<T> items) => items.toList()..shuffle(_random);
+
   /// Picks one entry from [weights] proportionally to its weight.
   T weighted<T>(Map<T, int> weights) {
     final total = weights.values.fold(0, (sum, weight) => sum + weight);
@@ -88,6 +91,10 @@ class DstIds {
       '${hex.substring(12, 16)}-${hex.substring(16, 20)}-${hex.substring(20)}',
     );
   }
+
+  /// Allocates node identities independently of replica/clock ordering.
+  List<UuidValue> nextShuffled(int count) =>
+      _random.shuffled([for (var index = 0; index < count; index++) next()]);
 }
 
 /// A manually advanced clock for the simulation.
