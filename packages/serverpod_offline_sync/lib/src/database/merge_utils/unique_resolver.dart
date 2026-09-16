@@ -250,6 +250,7 @@ class CrdtUniqueConflictResolver {
 @internal
 String canonicalProjectionValue(Object? value) {
   if (value == null) return '';
+  if (value is String) return value;
   final uuid = tryUuidValue(value);
   if (uuid != null) return uuid.uuid;
   return value.toString();
@@ -259,6 +260,7 @@ String canonicalProjectionValue(Object? value) {
 @internal
 bool projectionValuesEqual(Object? left, Object? right) {
   if (left == null || right == null) return left == right;
+  if (left is String && right is String) return left == right;
   final leftUuid = tryUuidValue(left);
   final rightUuid = tryUuidValue(right);
   if (leftUuid != null && rightUuid != null) {

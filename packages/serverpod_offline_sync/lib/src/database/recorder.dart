@@ -524,9 +524,7 @@ class CrdtMutationRecorder {
             row,
             columns,
           ).entries)
-            (tableName, row.id as UuidValue, columnName): canonicalDomainValue(
-              value,
-            ),
+            (tableName, row.id as UuidValue, columnName): value,
     };
     var overlays = authored;
     if (columns == null) {
@@ -580,7 +578,11 @@ class CrdtMutationRecorder {
           column.columnName,
     ];
     return {
-      for (final columnName in columnNames) columnName: json[columnName],
+      for (final columnName in columnNames)
+        columnName: canonicalDomainValue(
+          json[columnName],
+          _context.columnsByTableAndName[row.table.tableName]?[columnName],
+        ),
     };
   }
 

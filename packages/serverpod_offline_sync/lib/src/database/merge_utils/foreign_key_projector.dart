@@ -306,7 +306,14 @@ class CrdtForeignKeyProjector {
         if (projectionValuesEqual(attempt.value, values[columnName])) continue;
 
         projectionWrites.add(
-          (fieldId: fieldId, value: attempt.value, reason: attempt.reason),
+          (
+            fieldId: fieldId,
+            value: canonicalDomainValue(
+              attempt.value,
+              _context.columnsByTableAndName[tableName]?[columnName],
+            ),
+            reason: attempt.reason,
+          ),
         );
       }
     }
@@ -689,6 +696,7 @@ class CrdtForeignKeyProjector {
             inserting || writtenColumns == null || writtenColumns.contains(column)
                 ? supplied[column]
                 : previous[column],
+            _context.columnsByTableAndName[tableName]?[column],
           ),
       };
       if (!inserting) {
@@ -1557,9 +1565,15 @@ class CrdtForeignKeyProjector {
     // parent a row points at now and the one it is about to point at.
     Set<Object?> valuesFor(MergeRowKey rowKey, String columnName) {
       return <Object?>{
-        rows[rowKey]?.values[columnName],
+        canonicalDomainValue(
+          rows[rowKey]?.values[columnName],
+          _context.columnsByTableAndName[rowKey.$1]?[columnName],
+        ),
         if (unwrittenValues[rowKey]?.containsKey(columnName) ?? false)
-          unwrittenValues[rowKey]![columnName],
+          canonicalDomainValue(
+            unwrittenValues[rowKey]![columnName],
+            _context.columnsByTableAndName[rowKey.$1]?[columnName],
+          ),
       }..remove(null);
     }
 
@@ -2185,6 +2199,7 @@ class CrdtForeignKeyProjector {
           authoredOverlays.containsKey(fieldKey)
               ? authoredOverlays[fieldKey]
               : state.attemptedValues[fieldKey]?.value ?? domainValue,
+          _context.columnsByTableAndName[row.key.$1]?[columnName],
         );
       }
     }
@@ -2687,7 +2702,7 @@ class CrdtForeignKeyProjector {
       final attempted = CrdtDataAttemptedValue(
         id: current?.id,
         fieldId: write.fieldId,
-        value: canonicalDomainValue(write.value),
+        value: write.value,
         projectionReason: write.reason,
       );
       if (current == null) {
