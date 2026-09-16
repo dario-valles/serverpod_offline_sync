@@ -64,7 +64,11 @@ class _RepeatedDeliverySchedule extends DstRandom {
   _RepeatedDeliverySchedule() : super(916);
 
   @override
-  bool chance(double probability) => probability != 0.2;
+  bool chance(double probability) => switch (probability) {
+    DstAdversary.receiveIsolationProbability => false,
+    DstAdversary.collectionProbability || DstAdversary.resendProbability => true,
+    _ => throw StateError('Unspecified network decision with probability $probability'),
+  };
 
   @override
   T pick<T>(List<T> items) => items.first;

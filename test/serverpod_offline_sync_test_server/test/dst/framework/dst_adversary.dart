@@ -49,6 +49,10 @@ class DstAdversary {
   /// Creates an adversary over [replicas].
   DstAdversary(this.random, this.replicas);
 
+  static const receiveIsolationProbability = 0.2;
+  static const collectionProbability = 0.8;
+  static const resendProbability = 0.15;
+
   /// The simulation's randomness.
   final DstRandom random;
 
@@ -82,8 +86,8 @@ class DstAdversary {
   Future<void> step(Future<void> Function(DstReplica) onMerged) async {
     _round++;
 
-    if (random.chance(0.2)) _partitionRandomReplica();
-    if (random.chance(0.8)) await _collectFromRandomReplica();
+    if (random.chance(receiveIsolationProbability)) _partitionRandomReplica();
+    if (random.chance(collectionProbability)) await _collectFromRandomReplica();
 
     final deliveries = random.between(1, 3);
     for (var index = 0; index < deliveries; index++) {
@@ -153,7 +157,7 @@ class DstAdversary {
       // a no-op, so this is the idempotence probe rather than wasted work.
       // During quiescence only newly observed facts can keep the network busy;
       // deliberate duplicates must not masquerade as merge-authored changes.
-      final resend = allowResend && random.chance(0.15);
+      final resend = allowResend && random.chance(resendProbability);
       final fresh = resend
           ? changes
           : [
