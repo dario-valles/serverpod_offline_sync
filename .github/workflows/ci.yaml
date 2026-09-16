@@ -99,7 +99,7 @@ jobs:
       #     comment-tag: coverage-results
 
   simulation:
-    name: deterministic simulation
+    name: deterministic simulation (${{ matrix.topology }})
     runs-on: ubuntu-latest
     timeout-minutes: 60
     # Deliberately not on pull requests. The suite seeds from the clock, so it
@@ -109,12 +109,22 @@ jobs:
     # branches and on demand, where a failure is a finding rather than a
     # blocked review.
     if: github.event_name != 'pull_request'
+    strategy:
+      fail-fast: false
+      matrix:
+        topology: [convergence, cross_space]
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup
 
-      - name: Run the simulation suite
-        run: melos test-dst
+      - name: Run the simulation topology and ownership controls
+        # Four ten-minute simulation ceilings fit within each 60-minute job.
+        working-directory: test/serverpod_offline_sync_test_server
+        run: >-
+          dart test -P dst
+          test/dst/dst_${{ matrix.topology }}_test.dart
+          test/dst/dst_ownership_collision_test.dart
+          --concurrency=1
         env:
           # Depth matters: 200 rounds reproduces deferred engine failures that
           # 20-round empty worlds missed. Alternate populated conflict graphs

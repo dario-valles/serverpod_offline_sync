@@ -215,8 +215,9 @@ CI alternates sparse and populated profiles across four consecutive seeds at
 200 rounds in both topologies: 4,800 scheduled operation attempts, versus the
 previous 6,000 attempts spread across fifty shallow 20-round worlds. This keeps
 comparable attempt volume while exploring ten times the history depth and
-connected graphs. The simulation timeout is ten minutes per seed and the job
-budget is sixty minutes to allow the additional real database observations.
+connected graphs. Each topology runs in its own sixty-minute CI job with four
+ten-minute per-seed ceilings; a failure in one job does not cancel the other.
+Both jobs also run the ownership-collision controls.
 Known engine failures remain failures; CI is intentionally not a PR merge gate.
 
 ```sh
