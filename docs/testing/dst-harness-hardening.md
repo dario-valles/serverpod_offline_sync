@@ -245,7 +245,7 @@ scheduled work reaches 1,240 attempts and 786 commits. The simulations still sto
 on engine failures before completing their configured 200 rounds. No failing
 regression was skipped or converted into an expected refusal during this rebase.
 
-At `76125b0`, the complete ordinary test-server suite (`dart test test/ --concurrency=1`)
+The complete ordinary test-server suite (`dart test test/ --concurrency=1`)
 reports **842 passed, 2 retained engine failures and 3 tagged-suite skips**.
 The failures remain the 400-operation `unique_uuid.insertBatch` control and the
 width-three seed-62 populated `unique.swapUnique` control. The rebase logs are in
@@ -274,15 +274,17 @@ complete collector/merge batches.
 | `0605076` | Split CI by topology, retaining four seeds, 200 rounds, mixed workloads, width two and the existing 60-minute job timeout. Four ten-minute simulation ceilings fit each job; fail-fast is disabled and both jobs retain ownership controls. |
 | `de53f98` | Apply analyzer-required syntax cleanup to detector controls. |
 | `76125b0` | Reduce visible projected nullable-unique upsert loss independently of random scheduling. Four controls pass; three enabled regressions expose immediate loss, stale-claim resurrection after deleting the competitor, and durable loss after bootstrap. |
+| `134dcf9` | Pin the three-claim unique-swap failure independently of random scheduling. Two-row winner/loser and three-row loser/loser controls pass; the three-row winner/loser batch fails. Assertions retain submitted authored claims while permitting legitimate unique arbitration. |
+| `9725bde` | Document the CI tagged-file inventory and clarify that the local command runs the combined topology matrix. |
 
-The final review follow-up `8f80d9d` addresses one further detector gap: projection-present FK checks
-had positive coverage but lacked isolated rejection controls. The follow-up
+The final review follow-up `8f80d9d` addresses one further detector gap:
+projection-present FK checks had positive coverage but lacked isolated rejection controls. The follow-up
 adds six exact negative cases (wrong reason, redundant preserved value, wrong
 set-null value, wrong default, a repaired parent that is available, and an
 unrepairable visible child), plus positive cases for all five projection reasons.
 All **11 controls pass**. They operate only on detector inputs and never persist
-or merge damaged state. This is the only test addition after `76125b0`; the
-harness implementation and production paths used by the full-suite and deep
+or merge damaged state. Together with the three swap cases, these are the only
+test additions after `76125b0`; the harness implementation and production paths used by the deep
 replay below are unchanged.
 
 The review rejected a proposed snapshot cache: fresh pre-operation reads retain
@@ -295,11 +297,11 @@ The new guard requires the refusal predictor to grow when that schema changes.
 
 ### Current validation
 
-At the final detector revision, analysis reports no issues and formatting all
-30 DST Dart files makes no changes. The six new scalar/schema controls pass. The new independent
+At the closing revision, analysis reports no issues and formatting all 31 DST
+Dart files makes no changes. The six new scalar/schema controls pass. The independent
 engine regressions remain failures: three UUID-shaped TEXT cases, two projected
-claim-clock cases and three nullable-upsert loss cases. No production package
-has changed relative to `27d875e`.
+claim-clock cases, three nullable-upsert loss cases and one three-claim swap case.
+No production package has changed relative to `27d875e`.
 
 The fresh deep replay uses:
 
@@ -322,22 +324,42 @@ configured 200 rounds. The wider table/value population and node permutation
 change RNG consumption; the older seed results above are historical evidence,
 not a claim that their exact operation schedules survive this revision.
 
-At `76125b0`, the complete ordinary test-server suite (`dart test test/ --concurrency=1
---reporter expanded`) reports **873 passed, 10 engine failures and 3 tagged-suite
-skips** in 4 minutes 7 seconds. All failures are in DST regressions: the eight
-new stable engine checks above, the original 400-operation control (now hitting
-UUID-shaped TEXT during `unique.update`), and the width-three seed-62 populated
-control (still hitting the physical UNIQUE refusal in `unique.swapUnique`).
-The other test-server suites pass. This is a validation of the harness changes
-with explicitly retained engine failures, not a green production release.
+The closing complete ordinary test-server suite (`dart test test/
+--concurrency=1 --reporter expanded`) reports **886 passed, 11 engine failures
+and 3 tagged-suite skips** in 3 minutes 19 seconds. All failures are in DST
+regressions: the nine stable engine checks above, the original 400-operation
+control (now hitting UUID-shaped TEXT during `unique.update`), and the
+width-three seed-62 populated control (still hitting the physical UNIQUE refusal
+in `unique.swapUnique`). The other test-server suites pass. The earlier full run
+at `76125b0` was 873/10/3; the increase is exactly the eleven passing projection
+detector cases and the two passing/one failing swap cases. This validates the
+harness changes with retained engine failures, not a green production release.
 
 Commands use Dart 3.12.2 from Flutter 3.44.4. Logs and parsed metrics are under
-`/tmp/dst-opus-validation/`, particularly `final-server-all.log`,
-`final-mixed200.log`, `final-metrics.json`, `final-analyze.log`,
-`typed-controls.log`, `nullable-upsert-controls.log` and
-`projection-detector-controls.log`. Reviewer reports are
+`/tmp/dst-opus-validation/`, particularly `closing-server-all.log`,
+`final-server-all.log`, `final-mixed200.log`, `final-metrics.json`, `final-analyze.log`,
+`typed-controls.log`, `nullable-upsert-controls.log`,
+`projection-detector-controls.log` and `unique-swap-controls.log`. Reviewer
+reports are
 `/tmp/dst-opus-review-round1.md`, `/tmp/dst-opus-review-round2-planning.md`,
-`/tmp/dst-opus-review-round3-reduction.md` and the final review report.
+`/tmp/dst-opus-review-round3-reduction.md` and
+`/tmp/dst-opus-review-final.md` (including the final-increment addendum).
+
+### Final review closure
+
+The same Claude Opus 5 xhigh reviewer completed the comprehensive review after
+its rate-limit window reset, reporting **no remaining significant harness
+findings** through `81cdca1`. Its independent untagged DST rerun reported
+**115 passed, 10 retained engine failures and 3 tagged skips**. The addendum
+reviews the final three-scenario swap control through `9725bde`,
+including its description-only cleanup, and confirms the same verdict. It
+independently validates the oldest-claim arbitration that requires checking
+submitted claims instead of imposing a particular materialized winner. The
+final syntax-aware description artifact contains **20 files and 137 bullets**,
+with only the two environment-driven per-seed leaves unexpanded.
+All four documented defect families now have permanent, enabled regressions
+independent of random sweep schedules: UUID-shaped TEXT coercion, projected
+claim-clock advancement, visible upsert value loss, and the three-claim swap.
 
 ### Limits retained deliberately
 
@@ -348,3 +370,14 @@ lifecycle, transport framing, crash recovery and space grant/revoke protocols
 remain outside its schedule; existing integration suites cover adjacent layers.
 The failing engine regressions prevent a full-depth green validation. Neither a
 finite sweep nor the review proves correctness for every possible history.
+
+The review also records four non-blocking limits: the bootstrap helper's
+exception-reporting branch lacks a dedicated detector injection; the
+400-operation control stops at its first defect, so repairing one can reveal
+another; widening the text-claim alphabet from four to six values lowers
+random pairwise collision probability, while mandatory populated conflict
+coverage remains unchanged; and the general unique oracle does not prove that
+some contender materializes each winning claim. Independent exact-outcome
+integration tests complement that deliberately bounded oracle. CI's explicit
+file inventory now carries a maintenance comment so future tagged suites must
+be added to its command.

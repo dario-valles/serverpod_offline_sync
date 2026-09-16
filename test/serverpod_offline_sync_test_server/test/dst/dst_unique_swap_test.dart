@@ -10,7 +10,7 @@ void main() {
   for (final count in [2, 3]) {
     test(
       'Given $count visible rows contesting one unique name, '
-      'when a batch exchanges the winner and a released loser\'s materialised names, '
+      'when a batch exchanges the materialised names of the winner and a released loser, '
       'then the batch commits and preserves every submitted authored claim.',
       () async {
         final space = const Uuid().v7obj();
