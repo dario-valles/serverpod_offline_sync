@@ -13,7 +13,11 @@ clock; an explicit field at that same clock is equivalent. Replica-local integer
 IDs and space/node checkpoints are not portable facts.
 
 The generator retains submitted values before each ORM write and verifies them
-after commit. Full-row projected passthrough preserves its attempted value/HLC.
+after commit. Full-row projected passthrough preserves its attempted value.
+Omitting `columns`/`updateColumns` intentionally touches fields even when their
+values are unchanged. Scoped edits select only their intended columns. The
+oracle retains the acknowledged clocks after commit rather than requiring a
+full-row write to preserve the previous clocks.
 The oracle admits only the local before/after clock delta after these checks;
 an unrelated write cannot bless prior merged corruption. Controlled initial
 fixtures may initialize it explicitly. At quiescence, accepted row identities/spaces, effective field facts
@@ -266,7 +270,7 @@ complete collector/merge batches.
 | `bbc1604` | Validate persisted defaults in every field of a visible-row upsert, including unchanged nullable fields. Supply a visible parent in the acting space when the default is unavailable, or skip an unconstructible operation. Four real ORM controls cover missing, other-space, same-space defaults and no legal parent. |
 | `80226f3` | Quiescence stops introducing intentional duplicates while draining all pending and fresh complete batches. A real two-replica control forces repeated deliveries before proving stable facts drain. Ordinary scheduling still redelivers. |
 | `9a6c5e2` | Generate UUID-shaped unique TEXT claims, including distinct letter cases. Three public ORM/bootstrap/exchange regressions expose type coercion in production. Narrow refusal controls explicitly script their existing ordinary-text collision instead of depending on a random alphabet. |
-| `9c34147` | Two stable regressions pin full-row update/upsert passthrough of an unchanged projected unique claim: changing an unrelated field must preserve the original claim and field clock. Both expose the deferred clock-advancement defect. |
+| `9c34147` | Added two full-row update/upsert clock-preservation assertions, later identified as incorrect: omitting the column list intentionally touches unchanged fields. See the touch-contract correction below. |
 | `51c7485` | Assign node UUIDs through a seeded permutation independently of ordered clock offsets. Controls prove deterministic replay and both directions of node tie-break ordering. |
 | `006c522` | Positive/negative detector controls cover cross-space links, unequal subscriptions, causal-generation loss/regression, export omission and restore visibility evidence. Synthetic damaged snapshots only test detectors; invalid facts are never persisted or merged. |
 | `117153e` | Name adversarial decision probabilities and make the forced schedule reject unknown decisions, so its duplicate-delivery control cannot silently bind to a different branch. |
@@ -299,8 +303,10 @@ The new guard requires the refusal predictor to grow when that schema changes.
 
 At the closing revision, analysis reports no issues and formatting all 31 DST
 Dart files makes no changes. The six new scalar/schema controls pass. The independent
-engine regressions remain failures: three UUID-shaped TEXT cases, two projected
+checks at that revision failed in three UUID-shaped TEXT cases, two projected
 claim-clock cases, three nullable-upsert loss cases and one three-claim swap case.
+The two claim-clock cases were subsequently reclassified as incorrect test
+expectations; the other seven focused cases expose engine defects.
 No production package has changed relative to `27d875e`.
 
 The fresh deep replay uses:
@@ -325,9 +331,9 @@ change RNG consumption; the older seed results above are historical evidence,
 not a claim that their exact operation schedules survive this revision.
 
 The closing complete ordinary test-server suite (`dart test test/
---concurrency=1 --reporter expanded`) reports **886 passed, 11 engine failures
-and 3 tagged-suite skips** in 3 minutes 19 seconds. All failures are in DST
-regressions: the nine stable engine checks above, the original 400-operation
+--concurrency=1 --reporter expanded`) reports **886 passed, 11 test failures
+and 3 tagged-suite skips** in 3 minutes 19 seconds. Those failures include the
+two subsequently corrected clock expectations, seven stable engine checks, the original 400-operation
 control (now hitting UUID-shaped TEXT during `unique.update`), and the
 width-three seed-62 populated control (still hitting the physical UNIQUE refusal
 in `unique.swapUnique`). The other test-server suites pass. The earlier full run
@@ -350,16 +356,18 @@ reports are
 The same Claude Opus 5 xhigh reviewer completed the comprehensive review after
 its rate-limit window reset, reporting **no remaining significant harness
 findings** through `81cdca1`. Its independent untagged DST rerun reported
-**115 passed, 10 retained engine failures and 3 tagged skips**. The addendum
+**115 passed, 10 test failures and 3 tagged skips**, including the two
+subsequently corrected clock expectations. The addendum
 reviews the final three-scenario swap control through `9725bde`,
 including its description-only cleanup, and confirms the same verdict. It
 independently validates the oldest-claim arbitration that requires checking
 submitted claims instead of imposing a particular materialized winner. The
 final syntax-aware description artifact contains **20 files and 137 bullets**,
 with only the two environment-driven per-seed leaves unexpanded.
-All four documented defect families now have permanent, enabled regressions
-independent of random sweep schedules: UUID-shaped TEXT coercion, projected
-claim-clock advancement, visible upsert value loss, and the three-claim swap.
+Three defect families have permanent, enabled regressions independent of random
+sweep schedules: UUID-shaped TEXT coercion, visible upsert value loss, and the
+three-claim swap. The originally reported fourth family, claim-clock advancement,
+was an incorrect expectation about full-row writes, as corrected below.
 
 ### Limits retained deliberately
 
@@ -381,3 +389,38 @@ some contender materializes each winning claim. Independent exact-outcome
 integration tests complement that deliberately bounded oracle. CI's explicit
 file inventory now carries a maintenance comment so future tagged suites must
 be added to its command.
+
+
+## 2026-09-16 full-record touch contract correction
+
+An update/upsert without `columns`/`updateColumns` intentionally touches fields
+whose values have not changed. Changing only one property in `copyWith` does not
+narrow the database write. The prior DST rule requiring every projected
+passthrough clock to remain unchanged therefore reported valid writes as bugs.
+
+Remove that pre-write clock-equality requirement while retaining the independent
+submitted-value checks. `DstAuthoredOracle` still acknowledges the resulting
+field clocks after the local commit and requires those accepted facts to survive
+synchronization. Existing relationship/restoration controls retain their exact
+clock checks; their specific semantics are not inferred for every full-row save.
+
+The two failing projected-unique tests are replaced by six real ORM controls
+through the DST operation boundary: for both update and upsert, no column filter
+touches all fields, selecting only the changed third field preserves the other
+clocks, and selecting the unchanged second field alongside the third explicitly
+touches both. The preserved unique claim remains intact in every case.
+
+Validation from the test server with Dart 3.12.2:
+
+- Focused insertion, authored-oracle, and operation controls: **42 passed**.
+- Complete untagged DST (`dart test test/dst --concurrency=1 --reporter=json`):
+  **123 passed, 9 retained engine failures, 3 tagged skips**. The nine failing
+  test names exactly match the prior failures after removing the two incorrect
+  clock expectations; no engine failure was skipped or reclassified.
+- `dart analyze test/dst`: no issues; changed Dart files format without changes.
+
+The remaining failures are three focused UUID-shaped TEXT cases, three nullable
+upsert cases, one focused three-claim swap, and the two broader scenarios that
+reach TEXT coercion and the three-claim swap. The changed generator comment and
+oracle do not change the randomized schedule or production code. Logs are in
+`/tmp/dst-touch-contract/`.

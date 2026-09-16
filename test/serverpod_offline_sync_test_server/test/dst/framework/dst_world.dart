@@ -569,7 +569,8 @@ class DstOperations {
     final columns = _columns(table);
     if (action == DstAction.fullRowUpdate) {
       // A full model from a read often passes repaired fields back unchanged.
-      // Change an unrelated field where one exists to probe that distinction.
+      // Change an unrelated value where possible, but omit the column filter:
+      // this intentionally touches fields even when their values stay the same.
       final unrelated = columns
           .where(
             (column) =>

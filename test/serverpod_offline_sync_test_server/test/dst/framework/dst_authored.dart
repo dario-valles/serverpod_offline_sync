@@ -7,12 +7,13 @@ import 'dst_snapshot.dart';
 /// Inputs retained before an ORM call, independently of collection/projection.
 /// Full-row passthrough preserves an existing attempted value when the supplied
 /// column equals its materialized value; explicit column writes author it.
+/// Omitting the column list still touches fields whose values have not changed.
+/// Their resulting clocks are retained by [DstAuthoredOracle] after the commit.
 class DstWriteEvidence {
   DstWriteEvidence(this.before);
 
   final DstSnapshot before;
   final Map<DstFieldKey, Object?> values = {};
-  final Map<DstFieldKey, Hlc?> preservedClocks = {};
   final Map<String, bool> _visibilityChanges = {};
 
   void visibility(String table, Iterable<UuidValue> ids, {required bool deleted}) {
@@ -44,7 +45,6 @@ class DstWriteEvidence {
           ? defaults.single.defaultValue
           : data[column];
       values[key] = passthrough ? before.authoredValue(key) : supplied;
-      if (passthrough) preservedClocks[key] = before.fieldHlc(key);
     }
   }
 
@@ -70,14 +70,6 @@ class DstWriteEvidence {
           detail:
               '${entry.key} accepted ${dstValue(entry.value)} '
               'but retained ${dstValue(after.authoredValue(entry.key))} at ${after.fieldHlc(entry.key)}',
-        ),
-    for (final entry in preservedClocks.entries)
-      if (after.fieldHlc(entry.key) != entry.value)
-        (
-          property: 'acceptedWrite',
-          detail:
-              '${entry.key} advanced a projected passthrough '
-              'clock from ${entry.value} to ${after.fieldHlc(entry.key)}',
         ),
   ];
 }

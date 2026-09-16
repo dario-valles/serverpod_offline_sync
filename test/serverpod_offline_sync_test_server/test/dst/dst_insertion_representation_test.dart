@@ -9,14 +9,132 @@ import 'framework/dst_world.dart';
 
 void main() {
   initTestClientSession(createSessionPerTest: false);
-  for (final restore in [false, true]) {
-    test(
-      'Given a visible projected town ${restore ? 'restored with an older authored FK clock' : 'with a generation-one insertion marker'}, '
-      'when a full-row upsert changes only its name, '
-      'then authored FK preservation and canonical visibility remain valid.',
-      () async {
+  group('Given a visible projected town with a generation-one insertion marker, ', () {
+    late UuidValue space;
+    late DstReplica receiver;
+    late Person mayor;
+    late Town town;
+    late Town projected;
+    late DstSnapshot before;
+    late DstFieldKey key;
+    late String rowKey;
+    late DstOperations operations;
+
+    setUpAll(() async {
+      final ids = DstIds(DstRandom(81));
+      space = ids.next();
+      final clock = DstClock();
+      Future<DstReplica> replica(String name) => DstReplica.create(
+        name: name,
+        spaceUuids: [space],
+        nodeUuid: ids.next(),
+        clock: clock.clock,
+      );
+      final parentAuthor = await replica('parent');
+      receiver = await replica('receiver');
+      final source = await replica('source');
+      mayor = Person(id: ids.next(), name: 'mayor');
+      town = Town(id: ids.next(), name: 'original', mayorId: mayor.id);
+      await parentAuthor.withReplicaClock(
+        () => parentAuthor.session.db.transactionForUser(
+          space,
+          (tx) => Person.db.insertRow(parentAuthor.session, mayor, transaction: tx),
+        ),
+      );
+      await receiver.merge(await parentAuthor.collect(space), space);
+      await source.merge(await parentAuthor.collect(space), space);
+      await receiver.withReplicaClock(
+        () => receiver.session.db.transactionForUser(
+          space,
+          (tx) => Town.db.insertRow(receiver.session, town, transaction: tx),
+        ),
+      );
+      clock.advance(const Duration(milliseconds: 1));
+      await source.withReplicaClock(
+        () => source.session.db.transactionForUser(
+          space,
+          (tx) => source.session.db.upsertRow(
+            town,
+            conflictColumns: [Town.t.id],
+            transaction: tx,
+          ),
+        ),
+      );
+      await receiver.merge(await source.collect(space), space);
+      await parentAuthor.withReplicaClock(
+        () => parentAuthor.session.db.transactionForUser(
+          space,
+          (tx) => Person.db.deleteRow(parentAuthor.session, mayor, transaction: tx),
+        ),
+      );
+      await receiver.merge(await parentAuthor.collect(space), space);
+      projected = (await Town.db.findById(receiver.session, town.id!))!;
+      expect(projected.mayorId, isNull);
+      before = await DstSnapshot.capture(receiver);
+      key = ('town', town.id!, 'mayorId');
+      rowKey = 'town/${town.id}';
+      expect(before.tombstones[rowKey]!.clFlag, 1);
+      expect(
+        before.tombstones[rowKey]!.reason,
+        CrdtDataDeletedReason.userInsert,
+      );
+
+      operations = DstOperations(DstRandom(82), ids);
+      operations.oracle.accept(before);
+    });
+
+    group('when a full-row upsert changes only its name, ', () {
+      late DstSnapshot after;
+
+      setUpAll(() async {
+        await operations.perform(
+          receiver,
+          space,
+          table: DstTable.town,
+          action: DstAction.upsert,
+          body: (tx, evidence, refusal) async {
+            final write = projected.copyWith(name: 'renamed');
+            evidence.write('town', write.toJson());
+            await receiver.session.db.upsertRow(
+              write,
+              conflictColumns: [Town.t.id],
+              transaction: tx,
+            );
+            return DstOperationOutcome.applied;
+          },
+        );
+        after = await DstSnapshot.capture(receiver);
+      });
+
+      test('then authored FK preservation and canonical visibility remain valid.', () {
+        expect(after.fieldHlc(key), before.fieldHlc(key));
+        expect(after.authoredValue(key), mayor.id);
+        expect(after.rowHlcs[rowKey], before.rowHlcs[rowKey]);
+        expect(
+          after.canonicalTombstone('town', town.id!),
+          null,
+        );
+        expect(operations.oracle.validate(after, space), isEmpty);
+      });
+    });
+  });
+
+  group(
+    'Given a visible projected town restored with an older authored FK clock, ',
+    () {
+      late UuidValue space;
+      late DstReplica receiver;
+      late Person mayor;
+      late Town town;
+      late Town projected;
+      late DstSnapshot before;
+      late DstFieldKey key;
+      late String rowKey;
+      late DstOperations operations;
+
+      setUpAll(() async {
         final ids = DstIds(DstRandom(81));
-        final space = ids.next();
+        space = ids.next();
         final clock = DstClock();
         Future<DstReplica> replica(String name) => DstReplica.create(
           name: name,
@@ -25,10 +143,10 @@ void main() {
           clock: clock.clock,
         );
         final parentAuthor = await replica('parent');
-        final receiver = await replica('receiver');
+        receiver = await replica('receiver');
         final source = await replica('source');
-        final mayor = Person(id: ids.next(), name: 'mayor');
-        final town = Town(id: ids.next(), name: 'original', mayorId: mayor.id);
+        mayor = Person(id: ids.next(), name: 'mayor');
+        town = Town(id: ids.next(), name: 'original', mayorId: mayor.id);
         await parentAuthor.withReplicaClock(
           () => parentAuthor.session.db.transactionForUser(
             space,
@@ -62,140 +180,404 @@ void main() {
           ),
         );
         await receiver.merge(await parentAuthor.collect(space), space);
-        final projected = (await Town.db.findById(receiver.session, town.id!))!;
+        projected = (await Town.db.findById(receiver.session, town.id!))!;
         expect(projected.mayorId, isNull);
-        if (restore) {
-          await receiver.withReplicaClock(
-            () => receiver.session.db.transactionForUser(
-              space,
-              (tx) => Town.db.deleteRow(receiver.session, projected, transaction: tx),
-            ),
-          );
-          await receiver.withReplicaClock(
-            () => receiver.session.db.transactionForUser(
-              space,
-              (tx) => Town.db.insertRow(receiver.session, projected, transaction: tx),
-            ),
-          );
-        }
-        final before = await DstSnapshot.capture(receiver);
-        final key = ('town', town.id!, 'mayorId');
-        final rowKey = 'town/${town.id}';
-        expect(before.tombstones[rowKey]!.clFlag, restore ? 3 : 1);
+        await receiver.withReplicaClock(
+          () => receiver.session.db.transactionForUser(
+            space,
+            (tx) => Town.db.deleteRow(receiver.session, projected, transaction: tx),
+          ),
+        );
+        await receiver.withReplicaClock(
+          () => receiver.session.db.transactionForUser(
+            space,
+            (tx) => Town.db.insertRow(receiver.session, projected, transaction: tx),
+          ),
+        );
+        before = await DstSnapshot.capture(receiver);
+        key = ('town', town.id!, 'mayorId');
+        rowKey = 'town/${town.id}';
+        expect(before.tombstones[rowKey]!.clFlag, 3);
         expect(
           before.tombstones[rowKey]!.reason,
-          restore
-              ? CrdtDataDeletedReason.userReinsert
-              : CrdtDataDeletedReason.userInsert,
+          CrdtDataDeletedReason.userReinsert,
         );
-        if (restore) expect(before.fieldHlc(key)! < before.rowHlcs[rowKey]!, isTrue);
-        final operations = DstOperations(DstRandom(82), ids);
+        expect(before.fieldHlc(key)! < before.rowHlcs[rowKey]!, isTrue);
+        operations = DstOperations(DstRandom(82), ids);
         operations.oracle.accept(before);
+      });
 
-        await operations.perform(
-          receiver,
+      group('when a full-row upsert changes only its name, ', () {
+        late DstSnapshot after;
+
+        setUpAll(() async {
+          await operations.perform(
+            receiver,
+            space,
+            table: DstTable.town,
+            action: DstAction.upsert,
+            body: (tx, evidence, refusal) async {
+              final write = projected.copyWith(name: 'renamed');
+              evidence.write('town', write.toJson());
+              await receiver.session.db.upsertRow(
+                write,
+                conflictColumns: [Town.t.id],
+                transaction: tx,
+              );
+              return DstOperationOutcome.applied;
+            },
+          );
+          after = await DstSnapshot.capture(receiver);
+        });
+
+        test(
+          'then authored FK preservation and canonical visibility remain valid.',
+          () {
+            expect(after.fieldHlc(key), before.fieldHlc(key));
+            expect(after.authoredValue(key), mayor.id);
+            expect(after.rowHlcs[rowKey], before.rowHlcs[rowKey]);
+            expect(
+              after.canonicalTombstone('town', town.id!),
+              before.tombstones[rowKey],
+            );
+            expect(operations.oracle.validate(after, space), isEmpty);
+          },
+        );
+      });
+    },
+  );
+
+  group('Given a visible row with a projected unique text claim, ', () {
+    late UuidValue space;
+    late DstReplica replica;
+    late UniqueOverlapping loser;
+    late UniqueOverlapping projected;
+    late DstSnapshot before;
+    late DstFieldKey firstKey;
+    late DstFieldKey secondKey;
+    late DstFieldKey thirdKey;
+    late DstOperations operations;
+
+    setUp(() async {
+      final ids = DstIds(DstRandom(83));
+      space = ids.next();
+      replica = await DstReplica.create(
+        name: 'replica',
+        spaceUuids: [space],
+        nodeUuid: ids.next(),
+        clock: DstClock().clock,
+      );
+      final winner = UniqueOverlapping(
+        id: ids.next(),
+        first: 'a',
+        second: 'b',
+        third: 'c',
+      );
+      loser = UniqueOverlapping(
+        id: ids.next(),
+        first: 'a',
+        second: 'b',
+        third: 'z',
+      );
+      await replica.withReplicaClock(
+        () => replica.session.db.transactionForUser(
           space,
-          table: DstTable.town,
-          action: DstAction.upsert,
+          (tx) =>
+              UniqueOverlapping.db.insertRow(replica.session, winner, transaction: tx),
+        ),
+      );
+      await replica.withReplicaClock(
+        () => replica.session.db.transactionForUser(
+          space,
+          (tx) =>
+              UniqueOverlapping.db.insertRow(replica.session, loser, transaction: tx),
+        ),
+      );
+      before = await DstSnapshot.capture(replica);
+      firstKey = ('unique_overlapping', loser.id!, 'first');
+      secondKey = ('unique_overlapping', loser.id!, 'second');
+      thirdKey = ('unique_overlapping', loser.id!, 'third');
+      expect(before.projections[firstKey]?.attemptedValue, 'a');
+      projected = (await UniqueOverlapping.db.findById(replica.session, loser.id!))!;
+      expect(projected.first, isNot('a'));
+      operations = DstOperations(DstRandom(84), ids);
+      operations.oracle.accept(before);
+    });
+
+    group('when an update changes its third value without a column filter, ', () {
+      late DstSnapshot after;
+
+      setUp(() async {
+        await operations.perform(
+          replica,
+          space,
+          table: DstTable.uniqueOverlapping,
+          action: DstAction.fullRowUpdate,
           body: (tx, evidence, refusal) async {
-            final write = projected.copyWith(name: 'renamed');
-            evidence.write('town', write.toJson());
-            await receiver.session.db.upsertRow(
+            final write = projected.copyWith(third: 'renamed');
+            evidence.write('unique_overlapping', write.toJson());
+            await UniqueOverlapping.db.updateRow(
+              replica.session,
               write,
-              conflictColumns: [Town.t.id],
               transaction: tx,
             );
             return DstOperationOutcome.applied;
           },
         );
-        final after = await DstSnapshot.capture(receiver);
+        after = await DstSnapshot.capture(replica);
+      });
 
-        expect(after.fieldHlc(key), before.fieldHlc(key));
-        expect(after.authoredValue(key), mayor.id);
-        expect(after.rowHlcs[rowKey], before.rowHlcs[rowKey]);
-        expect(
-          after.canonicalTombstone('town', town.id!),
-          restore ? before.tombstones[rowKey] : null,
-        );
-        expect(operations.oracle.validate(after, space), isEmpty);
-      },
-    );
-  }
-
-  for (final upsert in [false, true]) {
-    test(
-      'Given a visible row with a projected unique text claim, '
-      'when a full-row ${upsert ? 'upsert' : 'update'} changes only another column, '
-      'then the preserved claim retains its authored value and field clock.',
-      () async {
-        final ids = DstIds(DstRandom(83));
-        final space = ids.next();
-        final replica = await DstReplica.create(
-          name: 'replica',
-          spaceUuids: [space],
-          nodeUuid: ids.next(),
-          clock: DstClock().clock,
-        );
-        final winner = UniqueOverlapping(
-          id: ids.next(),
-          first: 'a',
-          second: 'b',
-          third: 'c',
-        );
-        final loser = UniqueOverlapping(
-          id: ids.next(),
-          first: 'a',
-          second: 'b',
-          third: 'z',
-        );
-        for (final row in [winner, loser]) {
-          await replica.withReplicaClock(
-            () => replica.session.db.transactionForUser(
-              space,
-              (tx) => UniqueOverlapping.db.insertRow(
-                replica.session,
-                row,
-                transaction: tx,
-              ),
-            ),
+      test(
+        'then every field clock advances while the preserved claim stays intact.',
+        () {
+          expect(
+            after.rows['unique_overlapping']![loser.id]!.columns['third'],
+            'renamed',
           );
-        }
-        final before = await DstSnapshot.capture(replica);
-        final key = ('unique_overlapping', loser.id!, 'first');
-        expect(before.projections[key]?.attemptedValue, 'a');
-        final projected = (await UniqueOverlapping.db.findById(
-          replica.session,
-          loser.id!,
-        ))!;
-        expect(projected.first, isNot('a'));
+          expect(after.authoredValue(firstKey), 'a');
+          expect(after.authoredValue(secondKey), 'b');
+          expect(after.fieldHlc(firstKey), greaterThan(before.fieldHlc(firstKey)!));
+          expect(after.fieldHlc(secondKey), greaterThan(before.fieldHlc(secondKey)!));
+          expect(after.fieldHlc(thirdKey), greaterThan(before.fieldHlc(thirdKey)!));
+          expect(operations.committed, 1);
+          expect(operations.validationFailures, 0);
+          expect(operations.oracle.validate(after, space), isEmpty);
+        },
+      );
+    });
 
-        await replica.withReplicaClock(
-          () => replica.session.db.transactionForUser(space, (tx) async {
-            final write = projected.copyWith(third: 'renamed');
-            if (upsert) {
-              await replica.session.db.upsertRow(
-                write,
-                conflictColumns: [UniqueOverlapping.t.id],
-                transaction: tx,
-              );
-            } else {
+    group(
+      'when an update changes its third value with only the third column selected, ',
+      () {
+        late DstSnapshot after;
+
+        setUp(() async {
+          await operations.perform(
+            replica,
+            space,
+            table: DstTable.uniqueOverlapping,
+            action: DstAction.update,
+            body: (tx, evidence, refusal) async {
+              final write = projected.copyWith(third: 'renamed');
+              evidence.write('unique_overlapping', write.toJson(), columns: {'third'});
               await UniqueOverlapping.db.updateRow(
                 replica.session,
                 write,
+                columns: (t) => [t.third],
                 transaction: tx,
               );
-            }
-          }),
-        );
-        final after = await DstSnapshot.capture(replica);
+              return DstOperationOutcome.applied;
+            },
+          );
+          after = await DstSnapshot.capture(replica);
+        });
 
-        expect(
-          after.rows['unique_overlapping']![loser.id]!.columns['third'],
-          'renamed',
+        test(
+          'then only the third field clock advances while the preserved claim stays intact.',
+          () {
+            expect(
+              after.rows['unique_overlapping']![loser.id]!.columns['third'],
+              'renamed',
+            );
+            expect(after.authoredValue(firstKey), 'a');
+            expect(after.authoredValue(secondKey), 'b');
+            expect(after.fieldHlc(firstKey), before.fieldHlc(firstKey));
+            expect(after.fieldHlc(secondKey), before.fieldHlc(secondKey));
+            expect(after.fieldHlc(thirdKey), greaterThan(before.fieldHlc(thirdKey)!));
+            expect(operations.committed, 1);
+            expect(operations.validationFailures, 0);
+            expect(operations.oracle.validate(after, space), isEmpty);
+          },
         );
-        expect(after.authoredValue(key), 'a');
-        expect(after.fieldHlc(key), before.fieldHlc(key));
       },
     );
-  }
+
+    group(
+      'when an update changes its third value with the unchanged second column also selected, ',
+      () {
+        late DstSnapshot after;
+
+        setUp(() async {
+          await operations.perform(
+            replica,
+            space,
+            table: DstTable.uniqueOverlapping,
+            action: DstAction.update,
+            body: (tx, evidence, refusal) async {
+              final write = projected.copyWith(third: 'renamed');
+              evidence.write(
+                'unique_overlapping',
+                write.toJson(),
+                columns: {'second', 'third'},
+              );
+              await UniqueOverlapping.db.updateRow(
+                replica.session,
+                write,
+                columns: (t) => [t.second, t.third],
+                transaction: tx,
+              );
+              return DstOperationOutcome.applied;
+            },
+          );
+          after = await DstSnapshot.capture(replica);
+        });
+
+        test(
+          'then the second and third field clocks advance while the unselected claim stays intact.',
+          () {
+            expect(
+              after.rows['unique_overlapping']![loser.id]!.columns['third'],
+              'renamed',
+            );
+            expect(after.authoredValue(firstKey), 'a');
+            expect(after.authoredValue(secondKey), 'b');
+            expect(after.fieldHlc(firstKey), before.fieldHlc(firstKey));
+            expect(after.fieldHlc(secondKey), greaterThan(before.fieldHlc(secondKey)!));
+            expect(after.fieldHlc(thirdKey), greaterThan(before.fieldHlc(thirdKey)!));
+            expect(operations.committed, 1);
+            expect(operations.validationFailures, 0);
+            expect(operations.oracle.validate(after, space), isEmpty);
+          },
+        );
+      },
+    );
+
+    group('when an upsert changes its third value without a column filter, ', () {
+      late DstSnapshot after;
+
+      setUp(() async {
+        await operations.perform(
+          replica,
+          space,
+          table: DstTable.uniqueOverlapping,
+          action: DstAction.upsert,
+          body: (tx, evidence, refusal) async {
+            final write = projected.copyWith(third: 'renamed');
+            evidence.write('unique_overlapping', write.toJson());
+            await replica.session.db.upsertRow(
+              write,
+              conflictColumns: [UniqueOverlapping.t.id],
+              transaction: tx,
+            );
+            return DstOperationOutcome.applied;
+          },
+        );
+        after = await DstSnapshot.capture(replica);
+      });
+
+      test(
+        'then every field clock advances while the preserved claim stays intact.',
+        () {
+          expect(
+            after.rows['unique_overlapping']![loser.id]!.columns['third'],
+            'renamed',
+          );
+          expect(after.authoredValue(firstKey), 'a');
+          expect(after.authoredValue(secondKey), 'b');
+          expect(after.fieldHlc(firstKey), greaterThan(before.fieldHlc(firstKey)!));
+          expect(after.fieldHlc(secondKey), greaterThan(before.fieldHlc(secondKey)!));
+          expect(after.fieldHlc(thirdKey), greaterThan(before.fieldHlc(thirdKey)!));
+          expect(operations.committed, 1);
+          expect(operations.validationFailures, 0);
+          expect(operations.oracle.validate(after, space), isEmpty);
+        },
+      );
+    });
+
+    group(
+      'when an upsert changes its third value with only the third column selected, ',
+      () {
+        late DstSnapshot after;
+
+        setUp(() async {
+          await operations.perform(
+            replica,
+            space,
+            table: DstTable.uniqueOverlapping,
+            action: DstAction.upsert,
+            body: (tx, evidence, refusal) async {
+              final write = projected.copyWith(third: 'renamed');
+              evidence.write('unique_overlapping', write.toJson(), columns: {'third'});
+              await replica.session.db.upsertRow(
+                write,
+                conflictColumns: [UniqueOverlapping.t.id],
+                updateColumns: [UniqueOverlapping.t.third],
+                transaction: tx,
+              );
+              return DstOperationOutcome.applied;
+            },
+          );
+          after = await DstSnapshot.capture(replica);
+        });
+
+        test(
+          'then only the third field clock advances while the preserved claim stays intact.',
+          () {
+            expect(
+              after.rows['unique_overlapping']![loser.id]!.columns['third'],
+              'renamed',
+            );
+            expect(after.authoredValue(firstKey), 'a');
+            expect(after.authoredValue(secondKey), 'b');
+            expect(after.fieldHlc(firstKey), before.fieldHlc(firstKey));
+            expect(after.fieldHlc(secondKey), before.fieldHlc(secondKey));
+            expect(after.fieldHlc(thirdKey), greaterThan(before.fieldHlc(thirdKey)!));
+            expect(operations.committed, 1);
+            expect(operations.validationFailures, 0);
+            expect(operations.oracle.validate(after, space), isEmpty);
+          },
+        );
+      },
+    );
+
+    group(
+      'when an upsert changes its third value with the unchanged second column also selected, ',
+      () {
+        late DstSnapshot after;
+
+        setUp(() async {
+          await operations.perform(
+            replica,
+            space,
+            table: DstTable.uniqueOverlapping,
+            action: DstAction.upsert,
+            body: (tx, evidence, refusal) async {
+              final write = projected.copyWith(third: 'renamed');
+              evidence.write(
+                'unique_overlapping',
+                write.toJson(),
+                columns: {'second', 'third'},
+              );
+              await replica.session.db.upsertRow(
+                write,
+                conflictColumns: [UniqueOverlapping.t.id],
+                updateColumns: [UniqueOverlapping.t.second, UniqueOverlapping.t.third],
+                transaction: tx,
+              );
+              return DstOperationOutcome.applied;
+            },
+          );
+          after = await DstSnapshot.capture(replica);
+        });
+
+        test(
+          'then the second and third field clocks advance while the unselected claim stays intact.',
+          () {
+            expect(
+              after.rows['unique_overlapping']![loser.id]!.columns['third'],
+              'renamed',
+            );
+            expect(after.authoredValue(firstKey), 'a');
+            expect(after.authoredValue(secondKey), 'b');
+            expect(after.fieldHlc(firstKey), before.fieldHlc(firstKey));
+            expect(after.fieldHlc(secondKey), greaterThan(before.fieldHlc(secondKey)!));
+            expect(after.fieldHlc(thirdKey), greaterThan(before.fieldHlc(thirdKey)!));
+            expect(operations.committed, 1);
+            expect(operations.validationFailures, 0);
+            expect(operations.oracle.validate(after, space), isEmpty);
+          },
+        );
+      },
+    );
+  });
 }
