@@ -135,7 +135,7 @@ void main() {
 
         final violations = oracle.observe(
           'replica',
-          snapshot({if (next != null) key: next}),
+          snapshot({key: ?next}),
         );
 
         expect(
@@ -196,8 +196,9 @@ void main() {
           violations.map((v) => v.property),
           missingCity ? ['exportRoundTrip'] : isEmpty,
         );
-        if (missingCity)
+        if (missingCity) {
           expect(violations.single.detail, contains('missing accepted city'));
+        }
       },
     );
   }
