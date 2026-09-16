@@ -121,4 +121,81 @@ void main() {
       },
     );
   }
+
+  for (final upsert in [false, true]) {
+    test(
+      'Given a visible row with a projected unique text claim, '
+      'when a full-row ${upsert ? 'upsert' : 'update'} changes only another column, '
+      'then the preserved claim retains its authored value and field clock.',
+      () async {
+        final ids = DstIds(DstRandom(83));
+        final space = ids.next();
+        final replica = await DstReplica.create(
+          name: 'replica',
+          spaceUuids: [space],
+          nodeUuid: ids.next(),
+          clock: DstClock().clock,
+        );
+        final winner = UniqueOverlapping(
+          id: ids.next(),
+          first: 'a',
+          second: 'b',
+          third: 'c',
+        );
+        final loser = UniqueOverlapping(
+          id: ids.next(),
+          first: 'a',
+          second: 'b',
+          third: 'z',
+        );
+        for (final row in [winner, loser]) {
+          await replica.withReplicaClock(
+            () => replica.session.db.transactionForUser(
+              space,
+              (tx) => UniqueOverlapping.db.insertRow(
+                replica.session,
+                row,
+                transaction: tx,
+              ),
+            ),
+          );
+        }
+        final before = await DstSnapshot.capture(replica);
+        final key = ('unique_overlapping', loser.id!, 'first');
+        expect(before.projections[key]?.attemptedValue, 'a');
+        final projected = (await UniqueOverlapping.db.findById(
+          replica.session,
+          loser.id!,
+        ))!;
+        expect(projected.first, isNot('a'));
+
+        await replica.withReplicaClock(
+          () => replica.session.db.transactionForUser(space, (tx) async {
+            final write = projected.copyWith(third: 'renamed');
+            if (upsert) {
+              await replica.session.db.upsertRow(
+                write,
+                conflictColumns: [UniqueOverlapping.t.id],
+                transaction: tx,
+              );
+            } else {
+              await UniqueOverlapping.db.updateRow(
+                replica.session,
+                write,
+                transaction: tx,
+              );
+            }
+          }),
+        );
+        final after = await DstSnapshot.capture(replica);
+
+        expect(
+          after.rows['unique_overlapping']![loser.id]!.columns['third'],
+          'renamed',
+        );
+        expect(after.authoredValue(key), 'a');
+        expect(after.fieldHlc(key), before.fieldHlc(key));
+      },
+    );
+  }
 }
