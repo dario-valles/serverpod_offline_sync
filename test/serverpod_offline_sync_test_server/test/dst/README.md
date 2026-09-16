@@ -228,4 +228,3 @@ DST_SEED_BASE=62 DST_SEEDS=1 DST_ROUNDS=200 DST_PROFILE=populated DST_GRAPH_WIDT
 The oracle remains bounded: it does not independently arbitrate all unique
 winners or FK fixed points. Collector concurrency/checkpoint lifecycle, crash
 recovery, space grant/revoke, and transport framing remain outside this schedule.
-See `docs/testing/dst-harness-hardening.md` for exact validation and engine findings.
