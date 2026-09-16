@@ -432,7 +432,7 @@ class OfflineSyncDatabase implements Database {
       (tx) async {
         final prepared = _prepareRowsForInsert(rows, tx);
         final values = _recorder.withForeignKeyInsertDefaults(prepared.rows);
-        final projectionUnchanged = await _recorder.prepareLocalUpsert(
+        final projection = await _recorder.prepareLocalUpsert(
           values,
           conflictColumns,
           updateColumns,
@@ -475,7 +475,8 @@ class OfflineSyncDatabase implements Database {
           updatedRows,
           updateColumns,
           tx,
-          projectionUnchanged: projectionUnchanged,
+          projectionUnchanged: projection.projectionUnchanged,
+          domainBeforeUpsert: projection.domain,
         );
         if (noReturn) return <T>[];
         _stripStampedRows(result, prepared);
