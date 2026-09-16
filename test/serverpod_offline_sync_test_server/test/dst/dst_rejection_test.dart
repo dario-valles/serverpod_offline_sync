@@ -17,8 +17,8 @@ void main() {
     DstAction.updateBatch,
   ]) {
     test(
-      'Given visible unique rows occupying every generated name, '
-      'when the DST performs a competing ${action.name}, '
+      'Given visible unique rows claiming claim-0 through claim-3, '
+      'when the DST performs a competing claim-0 ${action.name}, '
       'then the supported write commits and preserves every authored claim.',
       () async {
         final random = DstRandom(43);
@@ -26,20 +26,52 @@ void main() {
         final space = ids.next();
         final replica = await _replica(ids, [space]);
         final operations = DstOperations(random, ids);
+        final originals = [
+          for (var i = 0; i < 4; i++) Unique(id: ids.next(), name: 'claim-$i'),
+        ];
         await replica.withReplicaClock(
           () => replica.session.db.transactionForUser(
             space,
-            (tx) => Unique.db.insert(replica.session, [
-              for (var i = 0; i < 4; i++) Unique(id: ids.next(), name: 'claim-$i'),
-            ], transaction: tx),
+            (tx) => Unique.db.insert(replica.session, originals, transaction: tx),
           ),
         );
 
-        final outcome = await operations.apply(
+        final writes = action == DstAction.updateBatch
+            ? [
+                for (final row in originals.skip(1).take(2))
+                  row.copyWith(name: 'claim-0'),
+              ]
+            : [
+                for (var i = 0; i < (action == DstAction.insertBatch ? 2 : 1); i++)
+                  Unique(id: ids.next(), name: 'claim-0'),
+              ];
+        final outcome = await operations.perform(
           replica,
           space,
           table: DstTable.unique,
           action: action,
+          body: (tx, evidence, refusal) async {
+            for (final row in writes) {
+              evidence.write('unique', row.toJson());
+            }
+            if (action == DstAction.updateBatch) {
+              await Unique.db.update(
+                replica.session,
+                writes,
+                columns: (t) => [t.name],
+                transaction: tx,
+              );
+            } else if (action == DstAction.insertBatch) {
+              await Unique.db.insert(replica.session, writes, transaction: tx);
+            } else {
+              await Unique.db.insertRow(
+                replica.session,
+                writes.single,
+                transaction: tx,
+              );
+            }
+            return DstOperationOutcome.applied;
+          },
         );
         final snapshot = await DstSnapshot.capture(replica);
 

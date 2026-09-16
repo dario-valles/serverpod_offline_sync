@@ -695,7 +695,9 @@ class DstOperations {
         final unique = dstUniqueIndexes.any(
           (index) => index.table == table && index.columns.contains(column.name),
         );
-        data[column.name] = unique ? 'claim-${random.nextInt(4)}' : _name(column.name);
+        data[column.name] = unique
+            ? dstUniqueTextValues[random.nextInt(dstUniqueTextValues.length)]
+            : _name(column.name);
       } else if ((column.dartType ?? '').startsWith('UuidValue')) {
         data[column.name] = dstUniqueValues[random.nextInt(dstUniqueValues.length)]
             .toJson();

@@ -269,7 +269,18 @@ final dstModels = <DstTable, DstModel<db.TableRow<models.UuidValue?>>>{
   ),
 };
 
-/// A small, deterministic claim alphabet, independent of row identity.
+/// Text claims remain text even when they resemble UUIDs. Letter case is
+/// significant for the generated SQLite TEXT unique indexes.
+const dstUniqueTextValues = [
+  'claim-0',
+  'claim-1',
+  'claim-2',
+  'claim-3',
+  '550e8400-e29b-41d4-a716-446655440111',
+  '550E8400-E29B-41D4-A716-446655440111',
+];
+
+/// A small, deterministic UUID claim alphabet, independent of row identity.
 const dstUniqueValues = [
   models.UuidValue.raw('660e8400-e29b-41d4-a716-446655440000'),
   models.UuidValue.raw('660e8400-e29b-41d4-a716-446655440001'),
