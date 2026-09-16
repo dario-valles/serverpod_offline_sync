@@ -395,6 +395,7 @@ class CrdtMutationRecorder {
           !_foreignKeys.tablesWithDefaultDependencies.contains(tableName)) {
         // The full pass has no persisted seed or default to load. Classification
         // after the physical upsert still reads metadata again.
+        validateAuthoredRows(rows, null);
         return (projectionUnchanged: false, domain: emptyDomain);
       }
       if (stored.length == rowIds.length &&
@@ -404,6 +405,7 @@ class CrdtMutationRecorder {
             inserting: false,
             columns: updateColumns,
           )) {
+        validateAuthoredRows(rows, updateColumns);
         return (projectionUnchanged: true, domain: emptyDomain);
       }
     }
@@ -433,6 +435,43 @@ class CrdtMutationRecorder {
       // Other conflict targets can update an existing row with a different id.
       seedRows: {for (final rowId in rowIds) (tableName, rowId)},
     );
+    if (_uniqueResolver.hasUniqueTextColumns(tableName)) {
+      final written = updateColumns?.map((column) => column.columnName).toSet();
+      for (final row in rows) {
+        final supplied = _authoredValuesFromRow(row, null);
+        for (final MapEntry(key: column, value: value) in supplied.entries) {
+          if (!_uniqueResolver.isReservedTextValue(tableName, column, value)) continue;
+          final before =
+              projected.domain[(tableName, row.id)] ??
+              projected.domain.entries
+                  .where(
+                    (entry) =>
+                        entry.key.$1 == tableName &&
+                        conflictColumns.every(
+                          (key) =>
+                              key.columnName == 'spaceId' ||
+                              (key.columnName == 'id'
+                                  ? entry.key.$2 == row.id
+                                  : projectionValuesEqual(
+                                      entry.value[key.columnName],
+                                      supplied[key.columnName],
+                                    )),
+                        ),
+                  )
+                  .firstOrNull
+                  ?.value;
+          if (before != null &&
+              ((written != null && !written.contains(column)) ||
+                  projectionValuesEqual(before[column], value))) {
+            continue;
+          }
+          // A new claim must fail before the physical upsert can collide with
+          // another row's generated name. Unchanged echoes are checked after
+          // the write, when we know whether it updated or restored the row.
+          _uniqueResolver.validateAuthoredValue(tableName, column, value);
+        }
+      }
+    }
     return (projectionUnchanged: false, domain: projected.domain);
   }
 
@@ -455,6 +494,8 @@ class CrdtMutationRecorder {
         !_foreignKeyProjector.needsProjection(tableName, null)) {
       return (rows: rows, attempts: unplanned);
     }
+
+    validateAuthoredRows(rows, null);
 
     if (await _foreignKeyProjector.canLeaveLocalProjectionUnchanged(
       rows,
@@ -574,6 +615,7 @@ class CrdtMutationRecorder {
             fieldKey: value,
       };
     }
+    _uniqueResolver.validateAuthoredFields(overlays);
     final planned = await _foreignKeyProjector.project(
       transaction,
       authoredOverlays: overlays,
@@ -593,6 +635,30 @@ class CrdtMutationRecorder {
           ),
       ],
     );
+  }
+
+  /// Validates unprojected ORM writes, or projected inserts with their attempts.
+  void validateAuthoredRows<T extends TableRow>(
+    List<T> rows,
+    List<Column>? columns, {
+    ProjectionAttemptsByField attempts = const {},
+  }) {
+    if (rows.isEmpty) return;
+    final tableName = rows.first.table.tableName;
+    if (!_uniqueResolver.hasUniqueTextColumns(tableName)) return;
+    for (final row in rows) {
+      for (final MapEntry(key: columnName, value: value) in _authoredValuesFromRow(
+        row,
+        columns,
+      ).entries) {
+        final key = (tableName, row.id, columnName);
+        _uniqueResolver.validateAuthoredValue(
+          tableName,
+          columnName,
+          attempts.containsKey(key) ? attempts[key]!.value : value,
+        );
+      }
+    }
   }
 
   Map<String, Object?> _authoredValuesFromRow<T extends TableRow>(
@@ -686,6 +752,7 @@ class CrdtMutationRecorder {
     Transaction transaction, {
     ProjectionAttemptsByField attempts = const {},
   }) async {
+    validateAuthoredRows(insertedRows, null, attempts: attempts);
     await _forTrackedRows(insertedRows, transaction, (
       tableName,
       rowIds,
@@ -801,6 +868,7 @@ class CrdtMutationRecorder {
                       )))
                 (tableName, row.id as UuidValue, columnName): value,
       };
+      _uniqueResolver.validateAuthoredFields(authoredOverlays);
       final implicitForeignKeyRepairFields = columns == null
           ? await _foreignKeyProjector.findImplicitRepairFields(
               tableName: tableName,

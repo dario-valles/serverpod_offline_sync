@@ -1,9 +1,11 @@
 import 'package:meta/meta.dart';
+import 'package:serverpod_database/serverpod_database.dart' show ColumnType;
 import 'package:serverpod_serialization/serverpod_serialization.dart';
 
 import '../../crdt/extensions.dart';
 import '../../generated/protocol.dart';
 import '../../hlc/hlc.dart';
+import '../exceptions.dart';
 import '../unique_index_utils.dart';
 import 'database_helpers.dart';
 import 'recorder_context.dart';
@@ -20,6 +22,50 @@ class CrdtUniqueConflictResolver {
   CrdtUniqueConflictResolver(this._context);
 
   final CrdtRecorderContext _context;
+
+  static final _reservedTextSuffix = RegExp(
+    '__(?:conflict|hidden|park)__[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-'
+    r'[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$',
+  );
+  final _uniqueTextColumns = <String, Set<String>>{};
+
+  Set<String> _textColumnsFor(String tableName) => _uniqueTextColumns.putIfAbsent(
+    tableName,
+    () => {
+      for (final column in uniqueColumnNamesFor(tableName))
+        if (_context.columnsByTableAndName[tableName]?[column]?.columnType ==
+            ColumnType.text)
+          column,
+    },
+  );
+
+  /// Whether authored text values need the reserved-suffix check.
+  bool hasUniqueTextColumns(String tableName) => _textColumnsFor(tableName).isNotEmpty;
+
+  /// Rejects authored names in the namespace owned by deterministic projection.
+  /// This checks the schema and input only, never the currently occupied names.
+  void validateAuthoredValue(String tableName, String columnName, Object? value) {
+    if (value is! String || !isReservedTextValue(tableName, columnName, value)) return;
+    throw OfflineSyncReservedValueException(
+      tableName: tableName,
+      columnName: columnName,
+      value: value,
+    );
+  }
+
+  /// Whether a value belongs to the generated namespace of a unique text column.
+  bool isReservedTextValue(String tableName, String columnName, Object? value) =>
+      value is String &&
+      value.contains('__') &&
+      _textColumnsFor(tableName).contains(columnName) &&
+      _reservedTextSuffix.hasMatch(value);
+
+  /// Validates a group of newly authored field facts.
+  void validateAuthoredFields(Map<MergeFieldKey, Object?> values) {
+    for (final MapEntry(key: key, value: value) in values.entries) {
+      validateAuthoredValue(key.$1, key.$3, value);
+    }
+  }
 
   /// Whether [tableName] has any synchronized unique index.
   bool tableHasUniqueIndexes(String tableName) =>

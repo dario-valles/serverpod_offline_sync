@@ -234,7 +234,8 @@ sync session for changes to take effect.
 
 Because of the nature of merge conflicts, the package imposes some data-modeling
 limitations. With `database: sync`, Serverpod reports most of them at generate
-time. The rest are enforced at runtime during initialization. Most are
+time. Other schema restrictions are checked during initialization; reserved
+values are checked when written or received through sync. Most are
 fundamental to the design and can never be lifted.
 
 - Every synced table must be defined with `database: sync`.
@@ -246,6 +247,11 @@ fundamental to the design and can never be lifted.
 - Global unique indexes are unsupported, except for FK-only indexes.
 - Unique indexes are only supported with at least one
   `String`/`UuidValue`/nullable column.
+- Unique text values cannot be authored with a suffix matching
+  `__conflict__<UUID>`, `__hidden__<UUID>`, or `__park__<UUID>`. These suffixes
+  belong to sync projection; new claims throw `OfflineSyncReservedValueException`.
+  Full-record saves can echo an unchanged displayed alternative while retaining
+  the original claim. Non-unique text fields are unrestricted.
 - All 1:1 relations must have the foreign-key column nullable (`optional`
   relation).
 - The only allowed non-synced-to-synced relation is `spaceId -> offline_sync_spaces.id`.

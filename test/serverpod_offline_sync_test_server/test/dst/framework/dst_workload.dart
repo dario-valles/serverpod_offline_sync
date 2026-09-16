@@ -82,8 +82,16 @@ Future<void> populateDstSpace({
     columns: {'oldCompanyId'},
   );
 
-  // Author a supported competing non-FK claim, then exercise unique tuple
-  // swapping and the same identity's delete/restore/redelete lifecycle.
+  // Exchange ordinary authored names before creating competing claims.
+  await operations.apply(
+    replica,
+    space,
+    table: DstTable.unique,
+    action: DstAction.swapUnique,
+  );
+  // Competing ordinary claims remain supported. Adopting a generated name in
+  // the following swap is an expected reserved-value refusal with rollback.
+  // Continue with the same identity's delete/restore/redelete lifecycle.
   await _write(
     replica,
     space,

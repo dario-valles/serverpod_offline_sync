@@ -783,6 +783,7 @@ class OfflineSyncDatabase implements Database {
         );
 
         final columns = columnValues.map((e) => e.column).toList();
+        _recorder.validateAuthoredRows(result, columns);
         await _recorder.afterUpdate(result, columns, tx);
         if (noReturn) return <T>[];
         result.forEach(_stripSpaceId);

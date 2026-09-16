@@ -64,6 +64,26 @@ non-null constraint, the FK constraint, or the unique constraint itself.
 The rewritten value is a materialized data value, not a synced conflict class.
 The core CRDT protocol does not need to expose unique conflict objects to users.
 
+### Reserved generated text values
+
+Authored values in unique text columns must not end in
+`__conflict__<UUID>`, `__hidden__<UUID>`, or `__park__<UUID>`, where the UUID uses
+the hexadecimal `8-4-4-4-12` shape. The marker is lowercase; hexadecimal letters
+can use either case. These names belong exclusively to projection, including
+hidden-row release and temporary writes. Non-unique text is unrestricted.
+
+Local writes and incoming sync facts enforce this rule with
+`OfflineSyncReservedValueException`. Rejected transactions do not advance
+authored data or sync progress. A full-row update/upsert can echo its own
+unchanged materialized alternative: it keeps the original authored claim and
+uses the normal field-touch semantics. Explicitly authoring an alternative on
+another record is rejected, including exchanges of displayed alternatives.
+
+This keeps the existing deterministic suffix construction. The resolver does
+not search currently occupied names for a free alternative. The original claim
+is what gets exported, so ordinary conflict projection and bootstrap remain
+valid under the input rule.
+
 ## Why Flag Is The Current Default
 
 The `flag` policy avoids the hard second-order effects caused by hiding or

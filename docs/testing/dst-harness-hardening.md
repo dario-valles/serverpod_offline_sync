@@ -1,5 +1,9 @@
 # DST harness hardening
 
+This document records the harness review and its historical validation. See
+[Captured DST engine regressions](dst-engine-fixes.md) for the subsequent fixes,
+the reserved-name contract, and current validation/performance results.
+
 The harness uses isolated SQLite replicas, the production ORM, collector and
 merge boundary. Production packages are unchanged. Replay is exact within a
 revision; correcting generator inputs can change schedules between revisions.

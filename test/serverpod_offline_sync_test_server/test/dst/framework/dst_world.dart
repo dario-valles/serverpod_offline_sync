@@ -348,7 +348,10 @@ class DstOperations {
         recorded = true;
         committed = true;
         final after = await DstSnapshot.capture(replica);
-        final blockers = refusal.deleteReasons(definiteOnly: true).toList();
+        final blockers = [
+          ...refusal.deleteReasons(definiteOnly: true),
+          ...refusal.reservedValueReasons(evidence),
+        ];
         if (blockers.isNotEmpty) {
           throw StateError('Blocked $path unexpectedly committed: $blockers');
         }
@@ -396,7 +399,7 @@ class DstOperations {
       // lost.
       throw StateError(
         'Local ${action.name} on ${table.tableName} at ${replica.name} '
-        'failed: $exception',
+        'failed: $exception; inputs: ${evidence.values}',
       );
     } finally {
       if (!recorded) {

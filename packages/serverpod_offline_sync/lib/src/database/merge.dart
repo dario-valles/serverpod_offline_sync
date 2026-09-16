@@ -87,6 +87,29 @@ extension CrdtMergeRecorderExtension on CrdtMutationRecorder {
     if (mergeSet.isEmpty) return;
 
     final operations = mergeSet.causallyOrderedChanges;
+    // Validate remote facts before touching rows or progress, including stale
+    // and repeated deliveries. Generated alternatives are never authored facts.
+    for (final operation in operations) {
+      if (!_context.isCrdtTrackedTableName(operation.tableName) ||
+          !_uniqueResolver.hasUniqueTextColumns(operation.tableName)) {
+        continue;
+      }
+      switch (operation) {
+        case CrdtMergeInsert():
+          for (final MapEntry(key: column, value: value)
+              in operation.databaseColumns.entries) {
+            _uniqueResolver.validateAuthoredValue(operation.tableName, column, value);
+          }
+        case CrdtMergeUpdate():
+          _uniqueResolver.validateAuthoredValue(
+            operation.tableName,
+            operation.columnName,
+            operation.value,
+          );
+        case CrdtMergeDelete():
+          break;
+      }
+    }
     // Nothing in this batch touches a foreign key or a unique index, so no
     // projection decision can change: skip both passes instead of loading
     // state for tables that cannot produce a candidate or a conflict.

@@ -7,105 +7,192 @@ import '../integration/test_tools/client_session.dart';
 void main() {
   initTestClientSession();
 
-  for (final count in [2, 3]) {
-    test(
-      'Given $count visible rows contesting one unique name, '
-      'when a batch exchanges the materialised names of the winner and a released loser, '
-      'then the batch commits and preserves every submitted authored claim.',
-      () async {
-        final space = const Uuid().v7obj();
-        await _contest(space, count: count, claim: 'contested');
-        final before = await _names();
-        expect(before.values.toSet(), hasLength(count));
-        final winner = before.entries
-            .singleWhere((row) => row.value == 'contested')
-            .key;
-        final loser = before.entries.firstWhere((row) => row.value != 'contested').key;
+  group('Given two visible rows contesting one unique name, ', () {
+    late UuidValue space;
+    late Map<UuidValue, String> before;
+    late Map<UuidValue, Object?> authoredBefore;
 
-        await session.db.transactionForUser(
-          space,
-          (tx) => Unique.db.update(
-            session,
-            [
-              Unique(id: winner, name: before[loser]!),
-              Unique(id: loser, name: before[winner]!),
-            ],
-            columns: (t) => [t.name],
-            transaction: tx,
-          ),
-        );
-
-        // The untouched third claimant can win the name by its older claim
-        // clock. Submission must survive regardless of that valid projection.
-        expect((await _names()).keys.toSet(), before.keys.toSet());
-        expect(await _authoredNames(), {
-          for (final id in before.keys) id: 'contested',
-          winner: before[loser],
-          loser: before[winner],
-        });
-      },
-    );
-  }
-
-  test(
-    'Given three visible rows contesting one unique name, '
-    'when the two released losers exchange their materialised names, '
-    'then the batch commits and preserves every submitted authored claim.',
-    () async {
-      final space = const Uuid().v7obj();
-      await _contest(space, count: 3, claim: 'contested');
-      final before = await _names();
-      final losers = before.entries
-          .where((row) => row.value != 'contested')
-          .map((row) => row.key)
-          .toList();
-      expect(losers, hasLength(2));
-
+    setUp(() async {
+      space = const Uuid().v7obj();
+      final first = Unique(id: const Uuid().v7obj(), name: 'initial-0');
+      final second = Unique(id: const Uuid().v7obj(), name: 'initial-1');
+      await session.db.transactionForUser(
+        space,
+        (tx) => Unique.db.insert(session, [first, second], transaction: tx),
+      );
       await session.db.transactionForUser(
         space,
         (tx) => Unique.db.update(
           session,
           [
-            Unique(id: losers[0], name: before[losers[1]]!),
-            Unique(id: losers[1], name: before[losers[0]]!),
+            first.copyWith(name: 'contested'),
+            second.copyWith(name: 'contested'),
           ],
           columns: (t) => [t.name],
           transaction: tx,
         ),
       );
+      before = await _names();
+      authoredBefore = await _authoredNames();
+    });
 
-      expect((await _names()).keys.toSet(), before.keys.toSet());
-      expect(await _authoredNames(), {
-        for (final id in before.keys) id: 'contested',
-        losers[0]: before[losers[1]],
-        losers[1]: before[losers[0]],
+    group(
+      'when a batch exchanges the materialised names of the winner and a released loser, ',
+      () {
+        Object? failure;
+
+        setUp(() async {
+          final winner = before.entries
+              .singleWhere((row) => row.value == 'contested')
+              .key;
+          final loser = before.entries
+              .firstWhere((row) => row.value != 'contested')
+              .key;
+          failure = null;
+          try {
+            await session.db.transactionForUser(
+              space,
+              (tx) => Unique.db.update(
+                session,
+                [
+                  Unique(id: winner, name: before[loser]!),
+                  Unique(id: loser, name: before[winner]!),
+                ],
+                columns: (t) => [t.name],
+                transaction: tx,
+              ),
+            );
+          } on Object catch (error) {
+            failure = error;
+          }
+        });
+
+        test(
+          'then the reserved name is rejected and all original claims remain intact.',
+          () async {
+            expect(before.values.toSet(), hasLength(2));
+            expect(failure, isA<OfflineSyncReservedValueException>());
+            expect(await _names(), before);
+            expect(await _authoredNames(), authoredBefore);
+          },
+        );
+      },
+    );
+  });
+
+  group('Given three visible rows contesting one unique name, ', () {
+    late UuidValue space;
+    late Map<UuidValue, String> before;
+    late Map<UuidValue, Object?> authoredBefore;
+
+    setUp(() async {
+      space = const Uuid().v7obj();
+      final first = Unique(id: const Uuid().v7obj(), name: 'initial-0');
+      final second = Unique(id: const Uuid().v7obj(), name: 'initial-1');
+      final third = Unique(id: const Uuid().v7obj(), name: 'initial-2');
+      await session.db.transactionForUser(
+        space,
+        (tx) => Unique.db.insert(session, [first, second, third], transaction: tx),
+      );
+      await session.db.transactionForUser(
+        space,
+        (tx) => Unique.db.update(
+          session,
+          [
+            first.copyWith(name: 'contested'),
+            second.copyWith(name: 'contested'),
+            third.copyWith(name: 'contested'),
+          ],
+          columns: (t) => [t.name],
+          transaction: tx,
+        ),
+      );
+      before = await _names();
+      authoredBefore = await _authoredNames();
+    });
+
+    group(
+      'when a batch exchanges the materialised names of the winner and a released loser, ',
+      () {
+        Object? failure;
+
+        setUp(() async {
+          final winner = before.entries
+              .singleWhere((row) => row.value == 'contested')
+              .key;
+          final loser = before.entries
+              .firstWhere((row) => row.value != 'contested')
+              .key;
+          failure = null;
+          try {
+            await session.db.transactionForUser(
+              space,
+              (tx) => Unique.db.update(
+                session,
+                [
+                  Unique(id: winner, name: before[loser]!),
+                  Unique(id: loser, name: before[winner]!),
+                ],
+                columns: (t) => [t.name],
+                transaction: tx,
+              ),
+            );
+          } on Object catch (error) {
+            failure = error;
+          }
+        });
+
+        test(
+          'then the reserved name is rejected and all original claims remain intact.',
+          () async {
+            expect(before.values.toSet(), hasLength(3));
+            expect(failure, isA<OfflineSyncReservedValueException>());
+            expect(await _names(), before);
+            expect(await _authoredNames(), authoredBefore);
+          },
+        );
+      },
+    );
+
+    group('when the two released losers exchange their materialised names, ', () {
+      late List<UuidValue> losers;
+      Object? failure;
+
+      setUp(() async {
+        losers = before.entries
+            .where((row) => row.value != 'contested')
+            .map((row) => row.key)
+            .toList();
+        failure = null;
+        try {
+          await session.db.transactionForUser(
+            space,
+            (tx) => Unique.db.update(
+              session,
+              [
+                Unique(id: losers[0], name: before[losers[1]]!),
+                Unique(id: losers[1], name: before[losers[0]]!),
+              ],
+              columns: (t) => [t.name],
+              transaction: tx,
+            ),
+          );
+        } on Object catch (error) {
+          failure = error;
+        }
       });
-    },
-  );
-}
 
-Future<void> _contest(
-  UuidValue space, {
-  required int count,
-  required String claim,
-}) async {
-  final rows = [
-    for (var index = 0; index < count; index++)
-      Unique(id: const Uuid().v7obj(), name: 'initial-$index'),
-  ];
-  await session.db.transactionForUser(
-    space,
-    (tx) => Unique.db.insert(session, rows, transaction: tx),
-  );
-  await session.db.transactionForUser(
-    space,
-    (tx) => Unique.db.update(
-      session,
-      [for (final row in rows) row.copyWith(name: claim)],
-      columns: (t) => [t.name],
-      transaction: tx,
-    ),
-  );
+      test(
+        'then the reserved names are rejected and all original claims remain intact.',
+        () async {
+          expect(losers, hasLength(2));
+          expect(failure, isA<OfflineSyncReservedValueException>());
+          expect(await _names(), before);
+          expect(await _authoredNames(), authoredBefore);
+        },
+      );
+    });
+  });
 }
 
 Future<Map<UuidValue, String>> _names() async => {

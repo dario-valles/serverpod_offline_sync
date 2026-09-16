@@ -14,6 +14,24 @@ class DstRejection {
   final UuidValue space;
   final Set<(DstTable, UuidValue)> deleting = {};
 
+  /// This input namespace is reserved by the public unique-text contract.
+  /// Keep the prediction independent of the production validator.
+  Iterable<String> reservedValueReasons(DstWriteEvidence writes) sync* {
+    final suffix = RegExp(
+      '__(conflict|hidden|park)__[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-'
+      r'[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$',
+    );
+    for (final MapEntry(key: key, value: value) in writes.values.entries) {
+      if (value is! String || !suffix.hasMatch(value)) continue;
+      if (!dstUniqueIndexes.any(
+        (index) => index.table.tableName == key.$1 && index.columns.contains(key.$3),
+      )) {
+        continue;
+      }
+      yield 'Reserved generated unique value for ${key.$1}.${key.$3}: $value';
+    }
+  }
+
   void delete(DstTable table, Iterable<UuidValue> ids) {
     deleting.addAll(ids.map((id) => (table, id)));
     var grew = true;
@@ -74,6 +92,7 @@ class DstRejection {
   }
 
   bool accepts(String message, DstWriteEvidence writes) {
+    if (reservedValueReasons(writes).contains(message)) return true;
     if (deleteReasons().any(message.contains)) return true;
     // Restoring a hidden row can resubmit a retained reference whose target
     // is unavailable. Match the actual submitted column and target, never an
