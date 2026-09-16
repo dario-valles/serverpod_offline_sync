@@ -81,7 +81,7 @@ insert/batch/update regressions verify supported operations really commit.
 
 `DST_PROFILE=sparse|populated|mixed` and `DST_GRAPH_WIDTH` accompany seed/rounds in
 replay messages. Mixed alternates even populated and odd sparse seeds. Populated
-worlds create all 32 tables and 28 authored FK edges, cycles, competing unique
+worlds create all 33 synchronized tables and 28 authored FK edges, cycles, competing unique
 writes, a verified tuple exchange, restore/redelete, retarget/detach and a blocked
 delete before random scheduling. Every scripted commit runs the same structural,
 causal, authoring and rollback observations as random operations. Complete
@@ -99,7 +99,7 @@ Passing 100+ round runs require at least 30 scheduled commits and merges;
 populated runs also require every declared authored FK edge and the deterministic
 semantic transitions. CI now uses four mixed seeds at 200 rounds across both
 topologies (4,800 scheduled attempts), replacing fifty shallow 20-round worlds
-(6,000 attempts). Per-simulation and job budgets are 10 and 60 minutes. These are
+(6,000 attempts). Per-simulation and per-topology job budgets are 10 and 60 minutes. These are
 configured allowances, not a measured full-depth runtime guarantee: genuine
 engine failures abort the current populated/deep runs before their full budget
 can be measured.
@@ -245,9 +245,106 @@ scheduled work reaches 1,240 attempts and 786 commits. The simulations still sto
 on engine failures before completing their configured 200 rounds. No failing
 regression was skipped or converted into an expected refusal during this rebase.
 
-The complete ordinary test-server suite (`dart test test/ --concurrency=1`)
+At `76125b0`, the complete ordinary test-server suite (`dart test test/ --concurrency=1`)
 reports **842 passed, 2 retained engine failures and 3 tagged-suite skips**.
 The failures remain the 400-operation `unique_uuid.insertBatch` control and the
 width-three seed-62 populated `unique.swapUnique` control. The rebase logs are in
 `/tmp/offline-sync-rebase/pr-123-test-app.log` and
 `/tmp/offline-sync-rebase/pr-123-dst-mixed200.log` on the validation workstation.
+
+## 2026-09-16 production-fidelity review
+
+Claude Opus 5 reviewed this branch at xhigh effort in the same session across
+successive rounds. The brief explicitly leaves production engine repairs for
+follow-up work: regressions remain enabled and assert the intended behavior.
+The review used a syntax-aware test-description inventory, traced apparent gaps
+through production code, and reduced failures through the public ORM and
+complete collector/merge batches.
+
+| Commit | Change and evidence |
+| --- | --- |
+| `bbc1604` | Validate persisted defaults in every field of a visible-row upsert, including unchanged nullable fields. Supply a visible parent in the acting space when the default is unavailable, or skip an unconstructible operation. Four real ORM controls cover missing, other-space, same-space defaults and no legal parent. |
+| `80226f3` | Quiescence stops introducing intentional duplicates while draining all pending and fresh complete batches. A real two-replica control forces repeated deliveries before proving stable facts drain. Ordinary scheduling still redelivers. |
+| `9a6c5e2` | Generate UUID-shaped unique TEXT claims, including distinct letter cases. Three public ORM/bootstrap/exchange regressions expose type coercion in production. Narrow refusal controls explicitly script their existing ordinary-text collision instead of depending on a random alphabet. |
+| `9c34147` | Two stable regressions pin full-row update/upsert passthrough of an unchanged projected unique claim: changing an unrelated field must preserve the original claim and field clock. Both expose the deferred clock-advancement defect. |
+| `51c7485` | Assign node UUIDs through a seeded permutation independently of ordered clock offsets. Controls prove deterministic replay and both directions of node tie-break ordering. |
+| `006c522` | Positive/negative detector controls cover cross-space links, unequal subscriptions, causal-generation loss/regression, export omission and restore visibility evidence. Synthetic damaged snapshots only test detectors; invalid facts are never persisted or merged. |
+| `117153e` | Name adversarial decision probabilities and make the forced schedule reject unknown decisions, so its duplicate-delivery control cannot silently bind to a different branch. |
+| `ee56fdc` | Add the missing generated `Types` model, completing all 33 synced tables. Generate boolean, UTC timestamp, wide integer, finite real, binary, enum and nullable values; decode JSON into Dart values at the predicate-update adapter. Six controls cover generation/bootstrap, nullable/enum predicate updates, concurrent scalar winners with duplicate delivery, catalog completeness and supported FK assumptions. |
+| `0605076` | Split CI by topology, retaining four seeds, 200 rounds, mixed workloads, width two and the existing 60-minute job timeout. Four ten-minute simulation ceilings fit each job; fail-fast is disabled and both jobs retain ownership controls. |
+| `de53f98` | Apply analyzer-required syntax cleanup to detector controls. |
+| `76125b0` | Reduce visible projected nullable-unique upsert loss independently of random scheduling. Four controls pass; three enabled regressions expose immediate loss, stale-claim resurrection after deleting the competitor, and durable loss after bootstrap. |
+
+The final review follow-up `8f80d9d` addresses one further detector gap: projection-present FK checks
+had positive coverage but lacked isolated rejection controls. The follow-up
+adds six exact negative cases (wrong reason, redundant preserved value, wrong
+set-null value, wrong default, a repaired parent that is available, and an
+unrepairable visible child), plus positive cases for all five projection reasons.
+All **11 controls pass**. They operate only on detector inputs and never persist
+or merge damaged state. This is the only test addition after `76125b0`; the
+harness implementation and production paths used by the full-suite and deep
+replay below are unchanged.
+
+The review rejected a proposed snapshot cache: fresh pre-operation reads retain
+independent evidence even after direct fixture writes. An initial runtime
+extrapolation was retracted after checking actual deep-run evidence; the CI
+change only fixes the mismatch between aggregate configured test ceilings and
+the single job budget. No new FK behavior was invented: the current generated
+schema has only `id` targets and cascade/no-action/set-null/set-default actions.
+The new guard requires the refusal predictor to grow when that schema changes.
+
+### Current validation
+
+At the final detector revision, analysis reports no issues and formatting all
+30 DST Dart files makes no changes. The six new scalar/schema controls pass. The new independent
+engine regressions remain failures: three UUID-shaped TEXT cases, two projected
+claim-clock cases and three nullable-upsert loss cases. No production package
+has changed relative to `27d875e`.
+
+The fresh deep replay uses:
+
+```sh
+DST_SEED_BASE=114 DST_SEEDS=4 DST_ROUNDS=200 DST_PROFILE=mixed DST_GRAPH_WIDTH=2 dart test -P dst test/dst --concurrency=1 --reporter expanded
+```
+
+It reports **3 passes and 8 engine failures** in 64 seconds. The passes are the
+three ownership-collision controls. All four overlapping-space seeds, plus
+single-space seeds 114, 115 and 117, expose UUID-shaped TEXT coercion (a String
+cast failure or a BLOB written to TEXT). Single-space seed 116 exposes a physical
+UNIQUE refusal on `unique_cascade_reference.upsert`.
+
+Current metrics are **630 attempts, 440 commits, 9 expected refusals, 180 skips,
+1 unexpected local failure and 0 committed validation failures**. The remaining
+seven failures occur during merge, outside local-operation counters. Setup
+accounts for 252 attempts; scheduled work reaches **378 attempts and 194
+commits**. Every simulation stops on an engine failure before completing its
+configured 200 rounds. The wider table/value population and node permutation
+change RNG consumption; the older seed results above are historical evidence,
+not a claim that their exact operation schedules survive this revision.
+
+At `76125b0`, the complete ordinary test-server suite (`dart test test/ --concurrency=1
+--reporter expanded`) reports **873 passed, 10 engine failures and 3 tagged-suite
+skips** in 4 minutes 7 seconds. All failures are in DST regressions: the eight
+new stable engine checks above, the original 400-operation control (now hitting
+UUID-shaped TEXT during `unique.update`), and the width-three seed-62 populated
+control (still hitting the physical UNIQUE refusal in `unique.swapUnique`).
+The other test-server suites pass. This is a validation of the harness changes
+with explicitly retained engine failures, not a green production release.
+
+Commands use Dart 3.12.2 from Flutter 3.44.4. Logs and parsed metrics are under
+`/tmp/dst-opus-validation/`, particularly `final-server-all.log`,
+`final-mixed200.log`, `final-metrics.json`, `final-analyze.log`,
+`typed-controls.log`, `nullable-upsert-controls.log` and
+`projection-detector-controls.log`. Reviewer reports are
+`/tmp/dst-opus-review-round1.md`, `/tmp/dst-opus-review-round2-planning.md`,
+`/tmp/dst-opus-review-round3-reduction.md` and the final review report.
+
+### Limits retained deliberately
+
+The harness checks real isolated SQLite replicas through the production ORM,
+collector and complete-batch merge boundary. It does not independently
+reimplement unique-winner or FK fixed-point arbitration. Collector checkpoint
+lifecycle, transport framing, crash recovery and space grant/revoke protocols
+remain outside its schedule; existing integration suites cover adjacent layers.
+The failing engine regressions prevent a full-depth green validation. Neither a
+finite sweep nor the review proves correctness for every possible history.
