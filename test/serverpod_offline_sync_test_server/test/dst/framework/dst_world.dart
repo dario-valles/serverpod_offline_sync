@@ -691,6 +691,8 @@ class DstOperations {
           value = (parent.toJson() as Map<String, dynamic>)[edge.parentColumn];
         }
         data[column.name] = value;
+      } else if (column.isNullable && random.chance(0.25)) {
+        data[column.name] = null;
       } else if ((column.dartType ?? '').startsWith('String')) {
         final unique = dstUniqueIndexes.any(
           (index) => index.table == table && index.columns.contains(column.name),
@@ -702,11 +704,9 @@ class DstOperations {
         data[column.name] = dstUniqueValues[random.nextInt(dstUniqueValues.length)]
             .toJson();
       } else if ((column.dartType ?? '').startsWith('int')) {
-        data[column.name] = column.isNullable && random.chance(0.25)
-            ? null
-            : random.nextInt(4);
+        data[column.name] = random.nextInt(4);
       } else {
-        throw StateError('No generated value for ${table.tableName}.${column.name}');
+        data[column.name] = dstTypedScalarJson(column.dartType, random.nextInt(1000));
       }
     }
     // A visible-row upsert supplies every model field, so persisted defaults

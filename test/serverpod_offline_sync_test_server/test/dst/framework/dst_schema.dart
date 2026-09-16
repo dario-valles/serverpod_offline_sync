@@ -1,3 +1,5 @@
+import 'dart:typed_data';
+
 import 'package:serverpod_database/serverpod_database.dart' as db;
 import 'package:serverpod_offline_sync_server/serverpod_offline_sync_server.dart';
 import 'package:serverpod_offline_sync_test_client/serverpod_offline_sync_test_client.dart'
@@ -5,6 +7,7 @@ import 'package:serverpod_offline_sync_test_client/serverpod_offline_sync_test_c
 
 /// Models whose domain rows the simulation authors and compares.
 enum DstTable {
+  types('types'),
   city('city'),
   person('person'),
   town('town'),
@@ -123,9 +126,7 @@ class DstModel<T extends db.TableRow<models.UuidValue?>> {
         if (values.containsKey(column.columnName))
           db.ColumnValue(
             column,
-            column is db.ColumnUuid && values[column.columnName] != null
-                ? models.UuidValue.withValidation(values[column.columnName] as String)
-                : values[column.columnName],
+            _columnValue(column, values[column.columnName]),
           ),
     ],
     transaction: tx,
@@ -139,6 +140,10 @@ class DstModel<T extends db.TableRow<models.UuidValue?>> {
 }
 
 final dstModels = <DstTable, DstModel<db.TableRow<models.UuidValue?>>>{
+  DstTable.types: DstModel<models.Types>(
+    table: models.Types.t,
+    fromJson: models.Types.fromJson,
+  ),
   DstTable.city: DstModel<models.City>(
     table: models.City.t,
     fromJson: models.City.fromJson,
@@ -268,6 +273,43 @@ final dstModels = <DstTable, DstModel<db.TableRow<models.UuidValue?>>>{
     fromJson: models.FkChainSetNullSetNullChild.fromJson,
   ),
 };
+
+/// updateWhere accepts Dart values, whereas generated model maps contain JSON.
+Object? _columnValue(db.Column column, Object? value) {
+  if (value == null) return null;
+  return switch (column) {
+    db.ColumnUuid() => models.UuidValueJsonExtension.fromJson(value),
+    db.ColumnDateTime() => models.DateTimeJsonExtension.fromJson(value),
+    db.ColumnBigInt() => models.BigIntJsonExtension.fromJson(value),
+    db.ColumnByteData() => models.ByteDataJsonExtension.fromJson(value),
+    db.ColumnEnum<models.TypesEnum>() => models.TypesEnum.fromJson(value as int),
+    _ => value,
+  };
+}
+
+/// JSON inputs for the remaining scalar types in the generated Types model.
+/// Finite reals, UTC instants, wide integers, and variable-size binary values
+/// exercise ordinary persisted values without adding invalid ORM inputs.
+Object dstTypedScalarJson(String? dartType, int sample) =>
+    switch (dartType?.replaceAll('?', '')) {
+      'bool' => sample.isEven,
+      'DateTime' => DateTime.utc(
+        2026,
+        1,
+        1,
+      ).add(Duration(milliseconds: sample * 1001)).toIso8601String(),
+      'BigInt' => (BigInt.parse('9007199254740993') + BigInt.from(sample)).toString(),
+      'double' => (sample - 500) / 8.0,
+      'dart:typed_data:ByteData' => models.ByteDataJsonExtension(
+        ByteData.sublistView(
+          Uint8List.fromList([
+            for (var index = 0; index < sample % 17; index++) (sample + index) % 256,
+          ]),
+        ),
+      ).toJson(),
+      'protocol:TypesEnum' => sample % models.TypesEnum.values.length,
+      _ => throw StateError('No DST scalar value for $dartType'),
+    };
 
 /// Text claims remain text even when they resemble UUIDs. Letter case is
 /// significant for the generated SQLite TEXT unique indexes.

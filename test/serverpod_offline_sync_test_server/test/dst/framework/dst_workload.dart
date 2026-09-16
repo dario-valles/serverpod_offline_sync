@@ -55,7 +55,7 @@ Future<void> populateDstSpace({
         } else if ((column.dartType ?? '').startsWith('int')) {
           data[column.name] = slot;
         } else {
-          throw StateError('No populated value for ${table.tableName}.${column.name}');
+          data[column.name] = dstTypedScalarJson(column.dartType, slot);
         }
       }
       batch.add(table.model.fromJson(data));

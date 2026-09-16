@@ -139,6 +139,11 @@ so stable replicas cannot exhaust the convergence limit merely through resends.
 | `framework/dst_coverage.dart` | Deduplicated authored transitions and observed graph shapes |
 | `framework/dst_runner.dart` | One seeded run, and failure reporting |
 
+Every generated synchronized table participates, including `Types` with boolean,
+UTC timestamp, text, integer, BigInt, finite real, binary, enum, and nullable
+values. Untagged schema guards fail if a new table, FK target column, or delete
+action needs generator or refusal-predictor support.
+
 The simulated graph includes nullable and required cascade, no-action,
 set-null, and set-default references, the mixed cascade/no-action chains, and
 all outbound references of person and organization. Person, company, and town
