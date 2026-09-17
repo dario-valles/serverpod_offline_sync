@@ -1,3 +1,8 @@
+## Unreleased
+
+- feat: Let applications observe successful merges on the server through
+  `Serverpod.offlineSyncOnMergeSuccess` / `initializeOfflineSync(onMergeSuccess: ...)`.
+
 ## 0.0.7
 
 - fix: Keep non-synced `updateRow` calls in the test harness transaction.

@@ -10,6 +10,15 @@ import 'offline_sync_spaces.dart';
 /// process-wide singleton.
 final _offlineSyncByServerpod = Expando<OfflineSyncEngine>('offlineSync');
 
+/// The merge callback configured per [Serverpod] instance by
+/// [OfflineSyncInitialize.initializeOfflineSync].
+///
+/// Keyed like [_offlineSyncByServerpod] so a pod running several [Serverpod]
+/// instances (tests, in particular) keeps one callback per instance.
+final _onMergeSuccessByServerpod = Expando<OfflineSyncOnMergeSuccess>(
+  'offlineSyncOnMergeSuccess',
+);
+
 /// Intercepts each Serverpod session database with a CRDT-aware database once
 /// [OfflineSyncInitialize.initializeOfflineSync] has configured sync.
 ///
@@ -37,10 +46,26 @@ extension OfflineSyncInitialize on Serverpod {
   ///
   /// [continuousSyncInterval] controls how long a continuous sync session waits
   /// after completing one sync round before checking for local changes again.
+  ///
+  /// [onMergeSuccess] is called after every successful merge of a client's
+  /// changes, with the space the merge landed in and the highest merged HLC.
+  /// It is the server-side notification a sync session produces: without it an
+  /// application that shows one user's synced rows to another user (a live
+  /// dashboard, a supervisor view) has no signal that anything changed and has
+  /// to poll. `OfflineSyncEndpoint` runs the sync session for every client and
+  /// forwards the callback registered here.
+  ///
+  /// The callback is awaited inside the sync session, so it should be cheap —
+  /// posting on [Session.messages] or scheduling work, not running a query
+  /// chain. An error thrown from it fails the sync session.
+  ///
+  /// A project whose generated `Serverpod` subclass already calls this method
+  /// registers the callback with [offlineSyncOnMergeSuccess] instead.
   void initializeOfflineSync({
     required List<Table> syncTables,
     int syncBatchSize = OfflineSyncEngine.defaultSyncBatchSize,
     Duration continuousSyncInterval = OfflineSyncEngine.defaultContinuousSyncInterval,
+    OfflineSyncOnMergeSuccess? onMergeSuccess,
   }) {
     _offlineSyncByServerpod[this] = OfflineSyncEngine(
       syncTables: syncTables,
@@ -48,6 +73,32 @@ extension OfflineSyncInitialize on Serverpod {
       syncBatchSize: syncBatchSize,
       continuousSyncInterval: continuousSyncInterval,
     );
+    _onMergeSuccessByServerpod[this] = onMergeSuccess;
+  }
+
+  /// The callback reported to after every successful merge of a client's
+  /// changes, or `null` when none is registered.
+  ///
+  /// Assign to it to register a callback on a [Serverpod] whose generated
+  /// subclass already called [initializeOfflineSync] — which is every project
+  /// generated with `experimental_features: databaseSync`, since the generator
+  /// emits `initializeOfflineSync(syncTables: syncTables)` into a file the
+  /// application must not edit:
+  ///
+  /// ```dart
+  /// final pod = Serverpod(args, Protocol(), Endpoints());
+  /// pod.offlineSyncOnMergeSuccess = (spaceUuid, syncedHlc) {
+  ///   board.notifySpaceChanged(spaceUuid);
+  /// };
+  /// await pod.start();
+  /// ```
+  ///
+  /// [initializeOfflineSync] overwrites it, so register after initialization.
+  OfflineSyncOnMergeSuccess? get offlineSyncOnMergeSuccess =>
+      _onMergeSuccessByServerpod[this];
+
+  set offlineSyncOnMergeSuccess(OfflineSyncOnMergeSuccess? onMergeSuccess) {
+    _onMergeSuccessByServerpod[this] = onMergeSuccess;
   }
 }
 
@@ -57,15 +108,27 @@ extension OfflineSyncInitialize on Serverpod {
 /// around the shared [OfflineSyncEngine] instance and the current [Session].
 class OfflineSyncSession {
   /// Creates CRDT services bound to a session.
-  OfflineSyncSession(this._session, this._sync);
+  ///
+  /// [onMergeSuccess] is the callback registered for the [Serverpod] instance
+  /// with [OfflineSyncInitialize.initializeOfflineSync], used by [sync] when
+  /// the caller does not pass one of its own.
+  OfflineSyncSession(this._session, this._sync, {this.onMergeSuccess});
 
   final Session _session;
   final OfflineSyncEngine _sync;
+
+  /// The merge callback configured for this session's [Serverpod] instance.
+  final OfflineSyncOnMergeSuccess? onMergeSuccess;
 
   /// Returns the server-side space management service.
   OfflineSyncSpaces get spaces => OfflineSyncSpaces(_session);
 
   /// Runs a CRDT sync session with this [OfflineSyncSession]'s [Session] bound.
+  ///
+  /// Reports successful merges to [onMergeSuccess] unless the caller passes its
+  /// own, which lets `OfflineSyncEndpoint` — and any endpoint an application
+  /// writes itself — deliver the callback registered with
+  /// [OfflineSyncInitialize.initializeOfflineSync] without knowing about it.
   Stream<OfflineSyncStreamEvent> sync({
     required UuidValue userId,
     required Stream<OfflineSyncStreamEvent> inbound,
@@ -79,7 +142,7 @@ class OfflineSyncSession {
       inbound: inbound,
       once: once,
       mode: mode,
-      onMergeSuccess: onMergeSuccess,
+      onMergeSuccess: onMergeSuccess ?? this.onMergeSuccess,
     );
   }
 }
@@ -96,6 +159,10 @@ extension OfflineSyncSessionExtension on Session {
         'the CRDT sync.',
       );
     }
-    return OfflineSyncSession(this, sync);
+    return OfflineSyncSession(
+      this,
+      sync,
+      onMergeSuccess: _onMergeSuccessByServerpod[server.serverpod],
+    );
   }
 }

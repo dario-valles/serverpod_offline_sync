@@ -238,6 +238,31 @@ sync session for changes to take effect.
 > an authorization policy (invitations, team ownership, etc.) and call the
 > `session.offlineSync.spaces` API accordingly.
 
+### Reacting to merges on the server
+
+A sync session is the only moment the server learns that a client changed
+anything. Register a callback on the pod to be notified when a client's changes
+have been merged, with the space they landed in and the highest merged HLC:
+
+```dart
+final pod = Serverpod(args, Protocol(), Endpoints());
+
+pod.offlineSyncOnMergeSuccess = (spaceUuid, syncedHlc) {
+  // e.g. push the space to a streaming endpoint watching it.
+  board.notifySpaceChanged(spaceUuid);
+};
+
+await pod.start();
+```
+
+The generated `Serverpod` subclass calls `initializeOfflineSync` for you, so
+register the callback on the pod after constructing it. When initializing sync
+by hand, pass it as `initializeOfflineSync(onMergeSuccess: ...)` instead.
+
+The callback is awaited inside the sync session and an error thrown from it
+fails that session, so keep it cheap: post a message, schedule work, update an
+in-memory index. Rows merged in that batch are readable when it runs.
+
 ### Data modeling limitations
 
 Because of the nature of merge conflicts, the package imposes some data-modeling
