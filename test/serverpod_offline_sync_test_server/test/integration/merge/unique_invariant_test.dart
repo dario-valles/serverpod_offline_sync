@@ -512,10 +512,13 @@ void main() {
           'deterministic conflict-free UUID unique value.',
           () async {
             final rows = await UniqueUuid.db.find(session);
-            final expectedConflictValue = const Uuid().v5obj(
+            final conflictHash = const Uuid().v5(
               Namespace.oid.value,
               '${UniqueUuid.t.tableName}.${UniqueUuid.t.value.columnName}:'
               '${sharedValue.uuid}__conflict__${loser.id!.uuid}',
+            );
+            final expectedConflictValue = UuidValue.fromString(
+              conflictHash.replaceRange(14, 15, '8'),
             );
 
             expect(rows, hasLength(2));

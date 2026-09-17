@@ -1,9 +1,11 @@
 import 'package:meta/meta.dart';
+import 'package:serverpod_database/serverpod_database.dart' show ColumnType;
 import 'package:serverpod_serialization/serverpod_serialization.dart';
 
 import '../../crdt/extensions.dart';
 import '../../generated/protocol.dart';
 import '../../hlc/hlc.dart';
+import '../exceptions.dart';
 import '../unique_index_utils.dart';
 import 'database_helpers.dart';
 import 'recorder_context.dart';
@@ -20,6 +22,73 @@ class CrdtUniqueConflictResolver {
   CrdtUniqueConflictResolver(this._context);
 
   final CrdtRecorderContext _context;
+
+  static final _reservedTextSuffix = RegExp(
+    '__(?:conflict|hidden|park)__[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-'
+    r'[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$',
+  );
+  final _uniqueTextColumns = <String, Set<String>>{};
+  final _syntheticUuidColumns = <String, Set<String>>{};
+
+  Set<String> _textColumnsFor(String tableName) => _uniqueTextColumns.putIfAbsent(
+    tableName,
+    () => {
+      for (final column in uniqueColumnNamesFor(tableName))
+        if (_context.columnsByTableAndName[tableName]?[column]?.columnType ==
+            ColumnType.text)
+          column,
+    },
+  );
+
+  Set<String> _uuidColumnsFor(String tableName) => _syntheticUuidColumns.putIfAbsent(
+    tableName,
+    () => {
+      for (final index in uniqueIndexesFor(tableName))
+        for (final column in index.releaseColumns)
+          if (column.kind == CrdtUniqueConflictReleaseKind.syntheticUuid)
+            column.columnName,
+    },
+  );
+
+  /// Whether authored values need a generated-namespace check.
+  bool hasReservedUniqueColumns(String tableName) =>
+      _textColumnsFor(tableName).isNotEmpty || _uuidColumnsFor(tableName).isNotEmpty;
+
+  /// Rejects authored values in the namespace owned by deterministic projection.
+  /// This checks the schema and input only, never the currently occupied names.
+  void validateAuthoredValue(String tableName, String columnName, Object? value) {
+    if (!isReservedValue(tableName, columnName, value)) return;
+    throw OfflineSyncReservedValueException(
+      tableName: tableName,
+      columnName: columnName,
+      value: value.toString(),
+    );
+  }
+
+  /// Generated text suffixes and version-8 UUIDs belong only to projection.
+  /// UUID checks apply only where the schema uses synthetic UUID release,
+  /// leaving primary keys, foreign keys, and nullable UUID columns unrestricted.
+  bool isReservedValue(String tableName, String columnName, Object? value) {
+    if (value is String &&
+        value.contains('__') &&
+        _textColumnsFor(tableName).contains(columnName) &&
+        _reservedTextSuffix.hasMatch(value)) {
+      return true;
+    }
+    if ((value is UuidValue || value is String) &&
+        _uuidColumnsFor(tableName).contains(columnName)) {
+      final uuid = value.toString();
+      return uuid.length == 36 && uuid[14] == '8';
+    }
+    return false;
+  }
+
+  /// Validates a group of newly authored field facts.
+  void validateAuthoredFields(Map<MergeFieldKey, Object?> values) {
+    for (final MapEntry(key: key, value: value) in values.entries) {
+      validateAuthoredValue(key.$1, key.$3, value);
+    }
+  }
 
   /// Whether [tableName] has any synchronized unique index.
   bool tableHasUniqueIndexes(String tableName) =>
@@ -77,6 +146,7 @@ class CrdtUniqueConflictResolver {
     required Map<MergeFieldKey, Object?> authoredByField,
     required Map<MergeFieldKey, Object?> claimByField,
     required Map<MergeFieldKey, Hlc> fieldHlcs,
+    bool resolveVisibleConflicts = true,
   }) {
     final reasons = <MergeFieldKey, CrdtProjectionReason>{};
     final tableNames = {for (final rowKey in valuesByRow.keys) rowKey.$1};
@@ -107,6 +177,9 @@ class CrdtUniqueConflictResolver {
           );
         }
 
+        // Local writes retain their proposed unique values so the database
+        // enforces uniqueness. Hidden rows still release their old values.
+        if (!resolveVisibleConflicts) continue;
         final groups = <String, List<MergeRowKey>>{};
         for (final rowKey in tableRowKeys) {
           if (hidden.contains(rowKey)) continue;
@@ -250,6 +323,7 @@ class CrdtUniqueConflictResolver {
 @internal
 String canonicalProjectionValue(Object? value) {
   if (value == null) return '';
+  if (value is String) return value;
   final uuid = tryUuidValue(value);
   if (uuid != null) return uuid.uuid;
   return value.toString();
@@ -259,6 +333,7 @@ String canonicalProjectionValue(Object? value) {
 @internal
 bool projectionValuesEqual(Object? left, Object? right) {
   if (left == null || right == null) return left == right;
+  if (left is String && right is String) return left == right;
   if (left is Map && right is Map) {
     return left.length == right.length &&
         left.entries.every(

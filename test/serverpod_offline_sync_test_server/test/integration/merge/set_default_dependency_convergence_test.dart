@@ -707,15 +707,12 @@ void main() {
           });
 
           test('then every exported payload and HLC comes from an author.', () {
-            final authoredPayloads = _payloads([
+            _expectAuthoredFacts(exportedFacts, [
               ...childFacts,
               ...deleteFacts,
               ...deletedDefaultFacts,
               ...restoredDefaultFacts,
             ]);
-            for (final entry in _payloads(exportedFacts).entries) {
-              expect(entry.value, authoredPayloads[entry.key]);
-            }
           });
 
           test('then the exported child retains its original authored parent.', () {
@@ -814,15 +811,12 @@ void main() {
           });
 
           test('then every exported payload and HLC comes from an author.', () {
-            final authoredPayloads = _payloads([
+            _expectAuthoredFacts(exportedFacts, [
               ...childFacts,
               ...deleteFacts,
               ...deletedDefaultFacts,
               ...restoredDefaultFacts,
             ]);
-            for (final entry in _payloads(exportedFacts).entries) {
-              expect(entry.value, authoredPayloads[entry.key]);
-            }
           });
 
           test('then the exported child retains its original authored parent.', () {
@@ -1260,14 +1254,11 @@ void main() {
           });
 
           test('then every exported payload and HLC comes from an author.', () {
-            final authoredPayloads = _payloads([
+            _expectAuthoredFacts(exportedFacts, [
               ...childFacts,
               ...deleteFacts,
               ...cityRestoration,
             ]);
-            for (final entry in _payloads(exportedFacts).entries) {
-              expect(entry.value, authoredPayloads[entry.key]);
-            }
           });
 
           test('then the exported child retains its original authored parent.', () {
@@ -1377,14 +1368,11 @@ void main() {
           });
 
           test('then every exported payload and HLC comes from an author.', () {
-            final authoredPayloads = _payloads([
+            _expectAuthoredFacts(exportedFacts, [
               ...childFacts,
               ...deleteFacts,
               ...cityRestoration,
             ]);
-            for (final entry in _payloads(exportedFacts).entries) {
-              expect(entry.value, authoredPayloads[entry.key]);
-            }
           });
 
           test('then the exported child retains its original authored parent.', () {
@@ -2957,3 +2945,36 @@ Map<String, dynamic> _payloads(CrdtMergeSet facts) => {
       jsonEncode(fact.toJson()),
     ),
 };
+
+// A restored row carries all its values at the new insertion HLC. Receivers
+// that already held the row can export those same facts as individual updates.
+void _expectAuthoredFacts(CrdtMergeSet exported, CrdtMergeSet authored) {
+  final payloads = _payloads(authored);
+  for (final fact in exported) {
+    final entry = _payloads([fact]).entries.single;
+    if (payloads.containsKey(entry.key)) {
+      expect(entry.value, payloads[entry.key]);
+      continue;
+    }
+    expect(fact, isA<CrdtMergeUpdate>());
+    final update = fact as CrdtMergeUpdate;
+    final insert = authored.inserts.singleWhere(
+      (candidate) =>
+          candidate.tableName == update.tableName &&
+          candidate.uuidRowId == update.uuidRowId &&
+          candidate.uuidSpaceId == update.uuidSpaceId &&
+          candidate.hlc == update.hlc,
+    );
+    expect(
+      testSyncTables
+          .singleWhere((table) => table.tableName == update.tableName)
+          .columns
+          .map((column) => column.columnName),
+      contains(update.columnName),
+    );
+    expect(
+      jsonDecode(jsonEncode(update.value)),
+      jsonDecode(jsonEncode(insert.databaseColumns[update.columnName])),
+    );
+  }
+}

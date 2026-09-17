@@ -2,7 +2,8 @@
 
 These suites drive several replicas through randomized operations and
 adversarial delivery, then check properties the engine must hold. A run is
-fully described by its seed, so a failure replays exactly.
+described by its seed, rounds, workload profile, and graph width. Those inputs
+replay exactly within the same source/SDK revision.
 
 They complement the `integration/` suites rather than replacing them.
 Integration tests pin specific scenarios and assert exact outcomes; these
@@ -27,8 +28,10 @@ directory are untagged and run with ordinary `dart test`.
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `DST_SEEDS` | 8 | How many seeds the sweep runs |
-| `DST_ROUNDS` | 12 | Operation rounds per simulation |
+| `DST_ROUNDS` | 40 | Operation rounds per simulation |
 | `DST_SEED_BASE` | unix seconds | First seed; successive seeds increment |
+| `DST_PROFILE` | sparse | `sparse`, `populated`, or `mixed` (even seeds populated, odd sparse) |
+| `DST_GRAPH_WIDTH` | 2 | Rows per table in each populated graph, minimum 2 |
 | `DST_DEBUG_TABLE` | unset | Print every merge touching this table, in delivery order |
 
 A divergence is usually explained by which facts a replica had merged when it
@@ -44,7 +47,7 @@ which defects those fixed seeds reach.
 Nothing is lost to reproducibility: a seed determines its simulation entirely
 and a failure prints its replay command. Tests are named by position rather
 than by seed, so the suite stays stable while the schedules underneath it vary.
-Pin `DST_SEED_BASE` to re-run an exact sweep.
+Pin the seed, rounds, profile, and graph width to re-run an exact sweep.
 
 The consequence to expect is that a run can fail for a defect unrelated to the
 change that triggered it. That is the suite doing its job; take the seed from
@@ -83,6 +86,10 @@ Determinism requires every source of variation to come from the seed.
   node UUID, so an unpinned node id makes concurrent merge winners
   nondeterministic.
 
+Node UUIDs are assigned to replicas through a seeded permutation, independently
+of the ordered clock offsets. Seeds can therefore explore both directions of
+the HLC node tie-break while replaying the same assignment exactly.
+
 Node identity is currently pinned by pre-creating the `CrdtNode` row and
 attaching it to every space, which relies on how `OfflineSyncSpaceManager` resolves
 the current node. `DstReplica._assertSeededNodeIdentity` fails loudly if that
@@ -91,8 +98,9 @@ injectable node id on the engine would remove the need for the trick.
 
 ## What the adversary does
 
-Reorders, delays, redelivers already-merged batches, and partitions replicas for
-a few rounds.
+Reorders, delays, redelivers already-merged batches, and isolates incoming
+delivery to selected replicas for a few rounds. Sources can still send during
+this receive isolation; this is not a bidirectional network partition.
 
 Two moves are deliberately unavailable, both because the merge contract states
 that input arrives as a causally complete snapshot of the sender
@@ -112,6 +120,10 @@ that input arrives as a causally complete snapshot of the sender
 Delay, reorder, and redelivery are the honest moves - and redelivery is how
 idempotence gets probed.
 
+When the schedule ends, quiescence drains every pending batch and collects only
+facts a receiver has not yet seen. It stops introducing deliberate duplicates,
+so stable replicas cannot exhaust the convergence limit merely through resends.
+
 ## Layout
 
 | File | Role |
@@ -120,8 +132,17 @@ idempotence gets probed.
 | `framework/dst_world.dart` | Replicas and operation generation |
 | `framework/dst_schema.dart` | Generated model adapters and declared unique indexes |
 | `framework/dst_adversary.dart` | Delivery scheduling and quiescence |
-| `framework/dst_snapshot.dart` | Canonical snapshots and the property oracle |
+| `framework/dst_snapshot.dart` | Portable domain/authored/projection snapshots and structural oracle |
+| `framework/dst_authored.dart` | Pre-write evidence, primary visibility intents, and accepted-fact retention |
+| `framework/dst_rejection.dart` | Concrete refusal prediction and accepted-error matching |
+| `framework/dst_workload.dart` | Populated per-space graphs and deterministic semantic transitions |
+| `framework/dst_coverage.dart` | Deduplicated authored transitions and observed graph shapes |
 | `framework/dst_runner.dart` | One seeded run, and failure reporting |
+
+Every generated synchronized table participates, including `Types` with boolean,
+UTC timestamp, text, integer, BigInt, finite real, binary, enum, and nullable
+values. Untagged schema guards fail if a new table, FK target column, or delete
+action needs generator or refusal-predictor support.
 
 The simulated graph includes nullable and required cascade, no-action,
 set-null, and set-default references, the mixed cascade/no-action chains, and
@@ -154,6 +175,14 @@ composite, fixed-discriminator, overlapping, FK-only composite, and space-scoped
 FK/text claims. The unique oracle reads all declared tuple components and space.
 A null component releases the tuple, as in SQL.
 
+Locally observable unique collisions are expected refusals. The predictor uses
+the pre-operation visible rows and submitted values, including composite tuples
+and space partitions. It matches the violated index and checks that domain data,
+authored metadata, and sync progress all roll back. Unexpected constraint errors
+still fail the run. Conflict-resolution scenarios author competing claims on
+disconnected replicas and merge them, so only independently accepted claims
+enter arbitration.
+
 The operation generator can insert, update, delete, restore a retained identity,
 upsert, pass a full model back through update, insert/update/delete a batch,
 swap unique tuples atomically, and perform predicate updates/deletes. Scripted regressions
@@ -161,3 +190,49 @@ use `DstOperations.apply` to select the same paths directly. Reports retain
 attempted and committed counts by table/action so a passing run does not hide
 which paths it visited. Rejected local transactions remain separate from
 committed operations.
+
+## Workload strength and metrics
+
+The populated profile creates every declared table and FK edge, closes the
+person/company/town cycles, and drives unique conflicts, a real tuple exchange,
+restore/redelete, FK retarget/detach, and a constrained refusal. These are actual
+ORM transactions, each checked immediately for structure, authored preservation,
+and causal monotonicity. Complete exports distribute the populated spaces before
+random scheduling starts. The sparse profile retains empty-world exploration.
+
+Every run emits one `DST_METRICS` JSON record, including failed runs. It separates
+setup attempts from scheduled commits and records attempted, committed, rejected,
+skipped, unexpected failures, and committed transactions whose oracle failed.
+A run failing during setup reports zero scheduled activity. Paths retain table
+and action; network observations include merge counts, duplicate batches, maximum
+batch size, total delivered changes, and receive-isolation events.
+
+Coverage counts distinct field/tombstone events rather than repeated snapshot
+appearances. FK edges and cycles are **authored graph** observations. Unique
+projection coverage reports columns, not a claim that every overlapping index
+conflicted. A swap counts only a validated exchange of two different tuples.
+The counters do not claim every FK transition or every unique shape was stressed.
+
+Passing simulations require scheduled commits and merges. At 100+ rounds the
+minimum is 30 scheduled commits; shorter runs are smoke checks. Populated runs
+also require all declared authored FK edges and the mandatory semantic paths.
+Setup commits alone cannot satisfy the scheduled-activity gate.
+
+CI alternates sparse and populated profiles across four consecutive seeds at
+200 rounds in both topologies: 4,800 scheduled operation attempts, versus the
+previous 6,000 attempts spread across fifty shallow 20-round worlds. This keeps
+comparable attempt volume while exploring ten times the history depth and
+connected graphs. Each topology runs in its own sixty-minute CI job with four
+ten-minute per-seed ceilings; a failure in one job does not cancel the other.
+Both jobs also run the ownership-collision controls. The local `melos test-dst`
+command runs both topologies together, so it covers the combined CI matrix.
+Known engine failures remain failures; CI is intentionally not a PR merge gate.
+
+```sh
+DST_SEED_BASE=114 DST_SEEDS=1 DST_ROUNDS=200 DST_PROFILE=populated DST_GRAPH_WIDTH=2 dart test -P dst
+DST_SEED_BASE=62 DST_SEEDS=1 DST_ROUNDS=200 DST_PROFILE=populated DST_GRAPH_WIDTH=3 dart test -P dst
+```
+
+The oracle remains bounded: it does not independently arbitrate all unique
+winners or FK fixed points. Collector concurrency/checkpoint lifecycle, crash
+recovery, space grant/revoke, and transport framing remain outside this schedule.

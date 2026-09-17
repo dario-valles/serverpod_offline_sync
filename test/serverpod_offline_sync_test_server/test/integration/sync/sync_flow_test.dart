@@ -8,6 +8,8 @@ import 'package:serverpod_offline_sync_test_client/serverpod_offline_sync_test_c
     as client;
 import 'package:serverpod_offline_sync_test_server/src/generated/protocol.dart'
     as server;
+import 'package:serverpod_offline_sync_test_shared/serverpod_offline_sync_test_shared.dart'
+    as shared;
 import 'package:test/test.dart';
 
 import '../test_tools/client_session.dart';
@@ -22,6 +24,8 @@ void main() {
     client.Person.t,
     client.Types.t,
     client.Unique.t,
+    shared.SharedParent.t,
+    shared.SharedChild.t,
   ];
 
   final serverSyncTables = [
@@ -29,6 +33,8 @@ void main() {
     server.Person.t,
     server.Types.t,
     server.Unique.t,
+    shared.SharedParent.t,
+    shared.SharedChild.t,
   ];
 
   late client.Client testClient;
@@ -569,7 +575,119 @@ void main() {
         );
       });
 
-      group('Given a pending client Types row with every field set,', () {
+      group(
+        'Given a pending shared-package parent and child with a plain flavor, ',
+        () {
+          late shared.SharedParent parent;
+          late shared.SharedChild child;
+
+          setUp(() async {
+            parent = await shared.SharedParent.db.insertRow(
+              clientSession,
+              shared.SharedParent(id: const Uuid().v7obj(), name: 'shared parent'),
+            );
+            child = await shared.SharedChild.db.insertRow(
+              clientSession,
+              shared.SharedChild(
+                id: const Uuid().v7obj(),
+                name: 'shared child',
+                flavor: shared.SharedFlavor.plain,
+                parentId: parent.id,
+              ),
+            );
+          });
+
+          group('when the client synchronizes through the endpoint, ', () {
+            setUp(() async {
+              await testClient.offlineSync.syncOnce(clientSession);
+            });
+
+            test(
+              'then the server receives the shared models, enum, and relation.',
+              () async {
+                final received = (await shared.SharedChild.db.findById(
+                  serverSession,
+                  child.id!,
+                ))!;
+                expect(received.name, 'shared child');
+                expect(received.flavor, shared.SharedFlavor.plain);
+                expect(received.parentId, parent.id);
+                expect(
+                  (await shared.SharedParent.db.findById(
+                    serverSession,
+                    parent.id!,
+                  ))!.name,
+                  'shared parent',
+                );
+              },
+            );
+          });
+
+          group(
+            'when the client changes the flavor between synchronization rounds, ',
+            () {
+              setUp(() async {
+                await testClient.offlineSync.syncOnce(clientSession);
+                await shared.SharedChild.db.updateRow(
+                  clientSession,
+                  child.copyWith(flavor: shared.SharedFlavor.salted),
+                  columns: (t) => [t.flavor],
+                );
+                await testClient.offlineSync.syncOnce(clientSession);
+              });
+
+              test(
+                'then the server receives the edited shared enum through the wire.',
+                () async {
+                  final received = (await shared.SharedChild.db.findById(
+                    serverSession,
+                    child.id!,
+                  ))!;
+                  expect(received.flavor, shared.SharedFlavor.salted);
+                  expect(received.parentId, parent.id);
+                },
+              );
+            },
+          );
+
+          group(
+            'when the server changes the flavor between synchronization rounds, ',
+            () {
+              setUp(() async {
+                await testClient.offlineSync.syncOnce(clientSession);
+                final stored = (await shared.SharedChild.db.findById(
+                  serverSession,
+                  child.id!,
+                ))!;
+                await serverSession.db.transactionForUser(
+                  testCrdtUserId,
+                  (tx) => shared.SharedChild.db.updateRow(
+                    serverSession,
+                    stored.copyWith(flavor: shared.SharedFlavor.salted),
+                    columns: (t) => [t.flavor],
+                    transaction: tx,
+                  ),
+                );
+                await testClient.offlineSync.syncOnce(clientSession);
+              });
+
+              test(
+                'then the client receives the edited shared enum through the wire.',
+                () async {
+                  final received = (await shared.SharedChild.db.findById(
+                    clientSession,
+                    child.id!,
+                  ))!;
+                  expect(received.flavor, shared.SharedFlavor.salted);
+                  expect(received.parentId, parent.id);
+                },
+              );
+            },
+          );
+        },
+      );
+
+      group('Given a pending client Types row with scalar and structured values,', () {
         late client.Types clientTypes;
 
         setUp(() async {
@@ -587,6 +705,17 @@ void main() {
                 Uint8List.fromList([1, 2, 3, 4]),
               ),
               anEnum: client.TypesEnum.gamma,
+              jsonDocument: client.SyncDocument(
+                title: 'wire JSON',
+                enabled: true,
+                numbers: [1, -2],
+              ),
+              jsonbDocument: client.SyncDocument(
+                title: 'wire JSONB',
+                enabled: false,
+                numbers: [3, -4],
+              ),
+              jsonbNumbers: [5, -6],
               optionalText: 'optional',
               optionalUuid: const Uuid().v7obj(),
             ),
@@ -618,6 +747,15 @@ void main() {
             expect(serverTypes.anEnum, server.TypesEnum.gamma);
             expect(serverTypes.optionalText, clientTypes.optionalText);
             expect(serverTypes.optionalUuid, clientTypes.optionalUuid);
+            expect(
+              serverTypes.jsonDocument!.toJson(),
+              clientTypes.jsonDocument!.toJson(),
+            );
+            expect(
+              serverTypes.jsonbDocument!.toJson(),
+              clientTypes.jsonbDocument!.toJson(),
+            );
+            expect(serverTypes.jsonbNumbers, [5, -6]);
           },
         );
 
@@ -647,6 +785,17 @@ void main() {
                   anEnum: client.TypesEnum.beta,
                   optionalText: null,
                   optionalUuid: updatedUuid,
+                  jsonDocument: client.SyncDocument(
+                    title: 'client JSON edit',
+                    enabled: false,
+                    numbers: [7, -8],
+                  ),
+                  jsonbDocument: client.SyncDocument(
+                    title: 'client JSONB edit',
+                    enabled: true,
+                    numbers: [9, -10],
+                  ),
+                  jsonbNumbers: [11, -12],
                 ),
               );
               await testClient.offlineSync.syncOnce(clientSession);
@@ -667,6 +816,23 @@ void main() {
               expect(merged.anEnum, server.TypesEnum.beta);
               expect(merged.optionalText, isNull);
               expect(merged.optionalUuid, updatedUuid);
+              expect(
+                merged.jsonDocument!.toJson(),
+                client.SyncDocument(
+                  title: 'client JSON edit',
+                  enabled: false,
+                  numbers: [7, -8],
+                ).toJson(),
+              );
+              expect(
+                merged.jsonbDocument!.toJson(),
+                client.SyncDocument(
+                  title: 'client JSONB edit',
+                  enabled: true,
+                  numbers: [9, -10],
+                ).toJson(),
+              );
+              expect(merged.jsonbNumbers, [11, -12]);
             });
           });
 
@@ -689,8 +855,27 @@ void main() {
                     aDateTime: updatedDateTime,
                     anInt64: updatedInt64,
                     anEnum: server.TypesEnum.beta,
+                    jsonDocument: server.SyncDocument(
+                      title: 'server JSON edit',
+                      enabled: false,
+                      numbers: [13, -14],
+                    ),
+                    jsonbDocument: server.SyncDocument(
+                      title: 'server JSONB edit',
+                      enabled: true,
+                      numbers: [15, -16],
+                    ),
+                    jsonbNumbers: [17, -18],
                   ),
-                  columns: (t) => [t.aBool, t.aDateTime, t.anInt64, t.anEnum],
+                  columns: (t) => [
+                    t.aBool,
+                    t.aDateTime,
+                    t.anInt64,
+                    t.anEnum,
+                    t.jsonDocument,
+                    t.jsonbDocument,
+                    t.jsonbNumbers,
+                  ],
                   transaction: tx,
                 ),
               );
@@ -706,6 +891,23 @@ void main() {
               expect(mergedTypes.aDateTime, updatedDateTime);
               expect(mergedTypes.anInt64, updatedInt64);
               expect(mergedTypes.anEnum, client.TypesEnum.beta);
+              expect(
+                mergedTypes.jsonDocument!.toJson(),
+                server.SyncDocument(
+                  title: 'server JSON edit',
+                  enabled: false,
+                  numbers: [13, -14],
+                ).toJson(),
+              );
+              expect(
+                mergedTypes.jsonbDocument!.toJson(),
+                server.SyncDocument(
+                  title: 'server JSONB edit',
+                  enabled: true,
+                  numbers: [15, -16],
+                ).toJson(),
+              );
+              expect(mergedTypes.jsonbNumbers, [17, -18]);
             },
           );
         });

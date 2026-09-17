@@ -22,6 +22,7 @@ out-of-the-box with Serverpod's existing APIs.
   - [Usage](#usage)
     - [Spaces and sharing](#spaces-and-sharing)
     - [Data modeling limitations](#data-modeling-limitations)
+      - [Reserved values](#reserved-values)
   - [How it works](#how-it-works)
   - [Performance](#performance)
   - [Example](#example)
@@ -100,17 +101,17 @@ Add the packages to the server and client `pubspec.yaml` files.
 ```yaml
 # your_project_client/pubspec.yaml
 dependencies:
-  serverpod_offline_sync_client: 0.0.7
+  serverpod_offline_sync_client: 0.0.8
 ```
 
 ```yaml
 # your_project_server/pubspec.yaml
 dependencies:
-  serverpod_offline_sync_server: 0.0.7
+  serverpod_offline_sync_server: 0.0.8
 ```
 
 > [!NOTE]
-> Version `0.0.7` requires Serverpod `4.0.0`.
+> Version `0.0.8` requires Serverpod `4.0.0`.
 
 After adding the dependencies, list the `serverpod_offline_sync` module on the
 `generator.yaml` file and enable the experimental `database: sync` option:
@@ -271,6 +272,21 @@ fundamental to the design and can never be lifted.
 Respecting these limitations, all other database invariants — including
 foreign-key actions — are preserved, with the exception of check constraints,
 which Serverpod does not support either.
+
+#### Reserved values
+
+Besides the schema restrictions, some values are reserved by the sync layer and
+cannot be authored by the user. Such values are used by the engine to resolve
+unique conflicts and are not expected to represent a restriction to real
+production usage. Trying to author a reserved value will immediately throw an
+`OfflineSyncReservedValueException` exception to prevent later conflicts.
+
+- Unique text values cannot be authored with a suffix matching
+  `__conflict__<UUID>`, `__hidden__<UUID>`, or `__park__<UUID>`. Non-unique
+  text fields are unrestricted.
+- Non-nullable unique UUID columns that are not foreign keys reserve version 8
+  for generated alternatives. Primary keys, foreign keys, nullable UUID columns
+  and non-unique UUID columns are unrestricted.
 
 ## How it works
 
