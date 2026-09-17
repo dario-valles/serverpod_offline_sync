@@ -1,5 +1,6 @@
 import 'dart:convert';
 
+import 'package:serverpod_database/serverpod_database.dart' show ColumnType;
 import 'package:serverpod_offline_sync_test_client/serverpod_offline_sync_test_client.dart';
 
 import 'dst_authored.dart';
@@ -67,7 +68,7 @@ class DstRejection {
     }
   }
 
-  /// This input namespace is reserved by the public unique-text contract.
+  /// These input namespaces are reserved by the public unique-value contract.
   /// Keep the prediction independent of the production validator.
   Iterable<String> reservedValueReasons(DstWriteEvidence writes) sync* {
     final suffix = RegExp(
@@ -75,12 +76,26 @@ class DstRejection {
       r'[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$',
     );
     for (final MapEntry(key: key, value: value) in writes.values.entries) {
-      if (value is! String || !suffix.hasMatch(value)) continue;
       if (!dstUniqueIndexes.any(
         (index) => index.table.tableName == key.$1 && index.columns.contains(key.$3),
       )) {
         continue;
       }
+      final table = dstTableDefinitions[key.$1]!;
+      final column = table.columns.firstWhere((column) => column.name == key.$3);
+      final textReserved =
+          column.columnType == ColumnType.text &&
+          value is String &&
+          suffix.hasMatch(value);
+      final uuid = value?.toString();
+      final uuidReserved =
+          column.columnType == ColumnType.uuid &&
+          !column.isNullable &&
+          !table.foreignKeys.any((key) => key.columns.contains(column.name)) &&
+          uuid != null &&
+          uuid.length == 36 &&
+          uuid[14] == '8';
+      if (!textReserved && !uuidReserved) continue;
       yield 'Reserved generated unique value for ${key.$1}.${key.$3}: $value';
     }
   }

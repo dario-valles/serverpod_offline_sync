@@ -765,10 +765,13 @@ WHERE "id" IN (${rowIds.sqlLiteralList()})
         }
       case CrdtUniqueConflictReleaseKind.syntheticUuid:
         if (value != null) {
-          return const Uuid().v5obj(
+          final hash = const Uuid().v5(
             Namespace.oid.value,
             '$tableName.${column.columnName}:${value}__${releaseSuffix}__$conflictingId',
           );
+          // Keep the deterministic payload, but mark these custom UUIDs with
+          // version 8 so authored values can be rejected without domain reads.
+          return UuidValue.fromString(hash.replaceRange(14, 15, '8'));
         }
     }
 

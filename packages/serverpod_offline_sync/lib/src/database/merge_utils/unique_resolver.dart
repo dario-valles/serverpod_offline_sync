@@ -28,6 +28,7 @@ class CrdtUniqueConflictResolver {
     r'[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$',
   );
   final _uniqueTextColumns = <String, Set<String>>{};
+  final _syntheticUuidColumns = <String, Set<String>>{};
 
   Set<String> _textColumnsFor(String tableName) => _uniqueTextColumns.putIfAbsent(
     tableName,
@@ -39,26 +40,48 @@ class CrdtUniqueConflictResolver {
     },
   );
 
-  /// Whether authored text values need the reserved-suffix check.
-  bool hasUniqueTextColumns(String tableName) => _textColumnsFor(tableName).isNotEmpty;
+  Set<String> _uuidColumnsFor(String tableName) => _syntheticUuidColumns.putIfAbsent(
+    tableName,
+    () => {
+      for (final index in uniqueIndexesFor(tableName))
+        for (final column in index.releaseColumns)
+          if (column.kind == CrdtUniqueConflictReleaseKind.syntheticUuid)
+            column.columnName,
+    },
+  );
 
-  /// Rejects authored names in the namespace owned by deterministic projection.
+  /// Whether authored values need a generated-namespace check.
+  bool hasReservedUniqueColumns(String tableName) =>
+      _textColumnsFor(tableName).isNotEmpty || _uuidColumnsFor(tableName).isNotEmpty;
+
+  /// Rejects authored values in the namespace owned by deterministic projection.
   /// This checks the schema and input only, never the currently occupied names.
   void validateAuthoredValue(String tableName, String columnName, Object? value) {
-    if (value is! String || !isReservedTextValue(tableName, columnName, value)) return;
+    if (!isReservedValue(tableName, columnName, value)) return;
     throw OfflineSyncReservedValueException(
       tableName: tableName,
       columnName: columnName,
-      value: value,
+      value: value.toString(),
     );
   }
 
-  /// Whether a value belongs to the generated namespace of a unique text column.
-  bool isReservedTextValue(String tableName, String columnName, Object? value) =>
-      value is String &&
-      value.contains('__') &&
-      _textColumnsFor(tableName).contains(columnName) &&
-      _reservedTextSuffix.hasMatch(value);
+  /// Generated text suffixes and version-8 UUIDs belong only to projection.
+  /// UUID checks apply only where the schema uses synthetic UUID release,
+  /// leaving primary keys, foreign keys, and nullable UUID columns unrestricted.
+  bool isReservedValue(String tableName, String columnName, Object? value) {
+    if (value is String &&
+        value.contains('__') &&
+        _textColumnsFor(tableName).contains(columnName) &&
+        _reservedTextSuffix.hasMatch(value)) {
+      return true;
+    }
+    if ((value is UuidValue || value is String) &&
+        _uuidColumnsFor(tableName).contains(columnName)) {
+      final uuid = value.toString();
+      return uuid.length == 36 && uuid[14] == '8';
+    }
+    return false;
+  }
 
   /// Validates a group of newly authored field facts.
   void validateAuthoredFields(Map<MergeFieldKey, Object?> values) {

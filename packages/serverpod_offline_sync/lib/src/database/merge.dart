@@ -91,7 +91,7 @@ extension CrdtMergeRecorderExtension on CrdtMutationRecorder {
     // and repeated deliveries. Generated alternatives are never authored facts.
     for (final operation in operations) {
       if (!_context.isCrdtTrackedTableName(operation.tableName) ||
-          !_uniqueResolver.hasUniqueTextColumns(operation.tableName)) {
+          !_uniqueResolver.hasReservedUniqueColumns(operation.tableName)) {
         continue;
       }
       switch (operation) {

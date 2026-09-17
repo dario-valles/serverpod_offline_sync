@@ -78,13 +78,21 @@ non-null constraint, the FK constraint, or the unique constraint itself.
 The rewritten value is a materialized data value, not a synced conflict class.
 The core CRDT protocol does not need to expose unique conflict objects to users.
 
-### Reserved generated text values
+### Reserved generated values
 
 Authored values in unique text columns must not end in
 `__conflict__<UUID>`, `__hidden__<UUID>`, or `__park__<UUID>`, where the UUID uses
 the hexadecimal `8-4-4-4-12` shape. The marker is lowercase; hexadecimal letters
 can use either case. These names belong exclusively to projection, including
 hidden-row release and temporary writes. Non-unique text is unrestricted.
+
+Non-nullable unique UUID columns that are not foreign keys reserve UUID version
+8 for generated alternatives (`xxxxxxxx-xxxx-8xxx-xxxx-xxxxxxxxxxxx`). Conflict,
+hidden-row, and temporary parking values use the same deterministic hash inputs
+as before, with the version marker set to 8. Authored version-8 values in these
+columns are rejected; ordinary UUID versions, including 4, 5, and 7, remain
+supported. Primary keys, foreign keys, nullable UUID columns, and non-unique UUID
+columns do not use synthetic UUID release and are not subject to this rule.
 
 Local writes and incoming sync facts enforce this rule with
 `OfflineSyncReservedValueException`. Rejected transactions do not advance
@@ -93,8 +101,8 @@ unchanged materialized alternative: it keeps the original authored claim and
 uses the normal field-touch semantics. Explicitly authoring an alternative on
 another record is rejected, including exchanges of displayed alternatives.
 
-This keeps the existing deterministic suffix construction. The resolver does
-not search currently occupied names for a free alternative. The original claim
+This keeps the existing deterministic text suffix construction. The resolver does
+not search currently occupied values for a free alternative. The original claim
 is what gets exported, so ordinary conflict projection and bootstrap remain
 valid under the input rule.
 

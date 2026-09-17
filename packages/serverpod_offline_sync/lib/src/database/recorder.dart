@@ -435,12 +435,12 @@ class CrdtMutationRecorder {
       // Other conflict targets can update an existing row with a different id.
       seedRows: {for (final rowId in rowIds) (tableName, rowId)},
     );
-    if (_uniqueResolver.hasUniqueTextColumns(tableName)) {
+    if (_uniqueResolver.hasReservedUniqueColumns(tableName)) {
       final written = updateColumns?.map((column) => column.columnName).toSet();
       for (final row in rows) {
         final supplied = _authoredValuesFromRow(row, null);
         for (final MapEntry(key: column, value: value) in supplied.entries) {
-          if (!_uniqueResolver.isReservedTextValue(tableName, column, value)) continue;
+          if (!_uniqueResolver.isReservedValue(tableName, column, value)) continue;
           final before =
               projected.domain[(tableName, row.id)] ??
               projected.domain.entries
@@ -466,7 +466,7 @@ class CrdtMutationRecorder {
             continue;
           }
           // A new claim must fail before the physical upsert can collide with
-          // another row's generated name. Unchanged echoes are checked after
+          // another row's generated value. Unchanged echoes are checked after
           // the write, when we know whether it updated or restored the row.
           _uniqueResolver.validateAuthoredValue(tableName, column, value);
         }
@@ -651,7 +651,7 @@ class CrdtMutationRecorder {
   }) {
     if (rows.isEmpty) return;
     final tableName = rows.first.table.tableName;
-    if (!_uniqueResolver.hasUniqueTextColumns(tableName)) return;
+    if (!_uniqueResolver.hasReservedUniqueColumns(tableName)) return;
     for (final row in rows) {
       for (final MapEntry(key: columnName, value: value) in _authoredValuesFromRow(
         row,
