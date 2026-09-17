@@ -191,15 +191,20 @@ class DemoController extends ChangeNotifier {
   void dispose() {
     _disposed = true;
     stopScenarioAutoPlay();
-    unawaited(_stopAllStreams());
-    for (final replica in _sessions.values) {
-      unawaited(replica.close());
-    }
+    unawaited(_closeSessions());
     for (final state in replicas.values) {
       state.dispose();
     }
     server.dispose();
     super.dispose();
+  }
+
+  Future<void> _closeSessions() async {
+    try {
+      await _stopAllStreams();
+    } finally {
+      await Future.wait(_sessions.values.map((replica) => replica.close()));
+    }
   }
 
   @override

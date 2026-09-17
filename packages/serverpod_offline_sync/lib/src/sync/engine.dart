@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 
 import 'package:clock/clock.dart';
 import 'package:serverpod_database/serverpod_database.dart';
@@ -96,14 +97,6 @@ class OfflineSyncEngine {
     for (final definition in _serializationManager.getTargetTableDefinitions())
       if (definition.dartName != null) definition.name: definition.dartName!,
   };
-
-  late final Map<String, Map<String, ColumnDefinition>> _columnDefinitionsByTableName =
-      {
-        for (final definition in _serializationManager.getTargetTableDefinitions())
-          definition.name: {
-            for (final column in definition.columns) column.name: column,
-          },
-      };
 
   /// The deterministic hash representing the current synchronized schema.
   late final String currentSyncTablesHash = computeSyncTablesHash(
@@ -835,7 +828,10 @@ class OfflineSyncEngine {
     DomainRowOwnerCache ownerCache,
   ) async {
     final cols = table.columns
-        .map((column) => '"${column.columnName.escapeIdentifier()}"')
+        .map(
+          (column) =>
+              '${_outboundColumnExpression(session, column)} AS "${column.columnName.escapeIdentifier()}"',
+        )
         .join(', ');
     final encodedRowId = rowId.sqlLiteral();
     final encodedSpaceId = spaceId.sqlLiteral();
@@ -851,16 +847,32 @@ class OfflineSyncEngine {
     }
     ownerCache[(tableName, rowId)] = (exists: true, spaceId: spaceId);
 
-    final columnMap = result.first.toColumnMap()
-      // Domain columns hold visible/materialized FK values; restore attempted
-      // values for override columns before building the outbound merge payload.
-      ..applyAuthoredAttemptedValues(attemptedValueFields)
-      // spaceId is local ownership metadata; it is never emitted on the wire.
-      ..remove('spaceId');
+    final rawColumns = result.first.toColumnMap();
+    final columnMap =
+        <String, dynamic>{
+            for (final column in table.columns)
+              column.columnName: _decodeStructuredValue(
+                session,
+                column,
+                rawColumns[column.columnName],
+              ),
+          }
+          // Domain columns hold visible/materialized FK values; restore attempted
+          // values for override columns before building the outbound merge payload.
+          ..applyAuthoredAttemptedValues(attemptedValueFields)
+          // spaceId is local ownership metadata; it is never emitted on the wire.
+          ..remove('spaceId');
 
-    final row = session.db.serializationManager.deserializeByClassName({
-      'className': dartName,
-      'data': columnMap,
+    // A table definition names its class the way its own package spells it, so
+    // a model owned by a shared package reports the unprefixed name while the
+    // host protocol answers only to the package-prefixed one. Carrying the name
+    // in the payload lets the host fall through to the protocol that owns the
+    // model rather than failing on a name it does not know.
+    // `Object` rather than `dynamic`: a dynamic target is read as a wrapped
+    // dynamic field instead of a model payload.
+    final row = session.db.serializationManager.deserialize<Object>({
+      ...columnMap,
+      '__className__': dartName,
     });
     return (exists: true, ownerSpaceId: spaceId, row: row);
   }
@@ -895,8 +907,11 @@ class OfflineSyncEngine {
     final encodedRowId = rowId.sqlLiteral();
     final encodedSpaceId = spaceId.sqlLiteral();
     final escapedTableName = tableName.escapeIdentifier();
+    final column = _syncTablesByName[tableName]!.columns.singleWhere(
+      (c) => c.columnName == columnName,
+    );
     final result = await session.db.unsafeQuery(
-      'SELECT "${columnName.escapeIdentifier()}" '
+      'SELECT ${_outboundColumnExpression(session, column)} '
       'FROM "$escapedTableName" '
       'WHERE "id" = $encodedRowId AND "spaceId" = $encodedSpaceId '
       'LIMIT 1',
@@ -906,7 +921,11 @@ class OfflineSyncEngine {
       return (
         exists: true,
         ownerSpaceId: spaceId,
-        value: _decodeColumnValue(tableName, columnName, result.first[0]),
+        value: _decodeColumnValue(
+          tableName,
+          columnName,
+          _decodeStructuredValue(session, column, result.first[0]),
+        ),
       );
     }
 
@@ -1031,28 +1050,45 @@ class OfflineSyncEngine {
     return fieldsByRowId;
   }
 
-  dynamic _decodeColumnValue(String tableName, String columnName, Object? value) {
-    if (value == null) return null;
-
-    final definition = _columnDefinitionsByTableName[tableName]?[columnName];
-    final dartType = definition?.dartType;
-    if (dartType == null) return value;
-
-    final className = _classNameForDartType(dartType);
-    return switch (className) {
-      'bool' || 'double' || 'int' || 'String' => value,
-      _ => _serializationManager.deserializeByClassName({
-        'className': className,
-        'data': value,
-      }),
-    };
+  String _outboundColumnExpression(DatabaseSession session, Column column) {
+    final identifier = '"${column.columnName.escapeIdentifier()}"';
+    if (session.db.dialect == DatabaseDialect.sqlite && column is ColumnStructured) {
+      return 'json($identifier)';
+    }
+    return identifier;
   }
 
-  String _classNameForDartType(String dartType) {
-    final withoutNullable = dartType.endsWith('?')
-        ? dartType.substring(0, dartType.length - 1)
-        : dartType;
-    return withoutNullable.split(':').last;
+  /// Temporary workaround for raw queries bypassing Serverpod's column-aware
+  /// result normalization. [_outboundColumnExpression] converts SQLite JSONB to
+  /// JSON text so this method can decode both JSON and JSONB before deserialization.
+  ///
+  /// TODO: Serverpod needs a public API for adapter-specific, column-aware decoding
+  /// of raw query results across supported types and databases. Replace this helper
+  /// and [_outboundColumnExpression] with that upstream API when it is available.
+  dynamic _decodeStructuredValue(
+    DatabaseSession session,
+    Column column,
+    Object? value,
+  ) {
+    if (session.db.dialect == DatabaseDialect.sqlite &&
+        (column is ColumnStructured || column is ColumnSerializable) &&
+        value is String) {
+      return jsonDecode(value);
+    }
+    return value;
+  }
+
+  dynamic _decodeColumnValue(
+    String tableName,
+    String columnName,
+    Object? value,
+  ) {
+    if (value == null) return null;
+
+    final column = _syncTablesByName[tableName]!.columns.singleWhere(
+      (column) => column.columnName == columnName,
+    );
+    return _serializationManager.deserialize<dynamic>(value, column.type);
   }
 
   static String _computeCanonicalSyncTablesSignature(

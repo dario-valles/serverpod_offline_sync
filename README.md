@@ -2,7 +2,7 @@
 
 [![GitHub](https://img.shields.io/badge/GitHub-marcelomendoncasoares-181717.svg?style=flat&logo=github)](https://github.com/marcelomendoncasoares)
 [![Pub Package](https://img.shields.io/pub/v/serverpod_offline_sync.svg)](https://pub.dev/packages/serverpod_offline_sync)
-[![Dart SDK Version](https://badgen.net/pub/sdk-version/serverpod_offline_sync.svg)](https://pub.dev/packages/serverpod_offline_sync)
+[![Dart SDK Version](https://badgen.net/pub/sdk-version/serverpod_offline_sync)](https://pub.dev/packages/serverpod_offline_sync)
 [![License: BSD 3-Clause](https://img.shields.io/badge/license-BSD_3--Clause-yellow.svg)](https://github.com/marcelomendoncasoares/serverpod_offline_sync/blob/main/LICENSE)
 [![CI](https://github.com/marcelomendoncasoares/serverpod_offline_sync/actions/workflows/ci.yaml/badge.svg?branch=main)](https://github.com/marcelomendoncasoares/serverpod_offline_sync/actions/workflows/ci.yaml)
 
@@ -100,17 +100,17 @@ Add the packages to the server and client `pubspec.yaml` files.
 ```yaml
 # your_project_client/pubspec.yaml
 dependencies:
-  serverpod_offline_sync_client: 0.0.6
+  serverpod_offline_sync_client: 0.0.7
 ```
 
 ```yaml
 # your_project_server/pubspec.yaml
 dependencies:
-  serverpod_offline_sync_server: 0.0.6
+  serverpod_offline_sync_server: 0.0.7
 ```
 
 > [!NOTE]
-> Version `0.0.6` requires Serverpod `4.0.0`.
+> Version `0.0.7` requires Serverpod `4.0.0`.
 
 After adding the dependencies, list the `serverpod_offline_sync` module on the
 `generator.yaml` file and enable the experimental `database: sync` option:
@@ -173,6 +173,14 @@ await client.offlineSync.syncOnce(session);
 
 // Or stream changes both ways until cancelled for a near-real-time sync.
 final syncSession = client.offlineSync.syncContinuously(session);
+```
+
+When disposing a client replica, cancel its sync subscription before closing
+the local database:
+
+```dart
+await syncSession.cancel();
+await session.close();
 ```
 
 ## Usage
