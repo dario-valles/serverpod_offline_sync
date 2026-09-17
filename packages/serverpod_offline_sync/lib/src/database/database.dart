@@ -520,6 +520,18 @@ class OfflineSyncDatabase implements Database {
         if (deletedRowIds.contains(row.id)) row,
     ];
     if (rowsToReinsert.isEmpty) return [];
+    // Hidden targets were filtered out of the delegate's upsert results, so
+    // its duplicate-target check cannot see these restorations. Check the
+    // submitted identities before turning them into ordinary updates.
+    if (rowsToReinsert.map((row) => row.id).toSet().length != rowsToReinsert.length) {
+      throw DatabaseQueryException(
+        'ON CONFLICT DO UPDATE command cannot affect row a second time',
+        code: switch (dialect) {
+          DatabaseDialect.postgres => PgErrorCode.cardinalityViolation,
+          DatabaseDialect.sqlite => SqliteErrorCode.integrityConstraintViolation,
+        },
+      );
+    }
 
     final plannedReinserts = await _recorder.planLocalUpdates(
       rowsToReinsert,

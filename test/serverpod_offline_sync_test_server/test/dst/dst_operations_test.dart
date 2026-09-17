@@ -4,6 +4,7 @@ import 'package:test/test.dart';
 
 import '../integration/test_tools/client_session.dart';
 import 'framework/dst_random.dart';
+import 'framework/dst_snapshot.dart';
 import 'framework/dst_world.dart';
 
 void main() {
@@ -57,7 +58,7 @@ void main() {
   test(
     'Given a deleted unique claimant and a newer claimant of the same name, '
     'when the DST restores the deleted identity, '
-    'then the original identity reclaims its name without deleting its peer.',
+    'then the renewed claim yields the name to its earlier peer.',
     () async {
       final random = DstRandom(4);
       final ids = DstIds(random);
@@ -88,9 +89,14 @@ void main() {
       expect(outcome, DstOperationOutcome.applied);
       final restored = await Unique.db.findById(replica.session, original.id!);
       final other = await Unique.db.findById(replica.session, peer.id!);
-      expect(restored?.name, 'shared');
-      expect(other, isNotNull);
-      expect(other!.name, isNot('shared'));
+      expect(restored?.name, 'shared__conflict__${original.id}');
+      expect(other?.name, 'shared');
+      final snapshot = await DstSnapshot.capture(replica);
+      expect(snapshot.authoredValue(('unique', original.id!, 'name')), 'shared');
+      expect(
+        snapshot.fieldHlc(('unique', original.id!, 'name')),
+        snapshot.rowHlcs['unique/${original.id}'],
+      );
     },
   );
 

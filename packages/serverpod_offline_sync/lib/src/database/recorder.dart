@@ -800,39 +800,36 @@ class CrdtMutationRecorder {
       rowIds,
       hlcManager,
     ) async {
-      final crdtDataRows = await _context.findRequiredCrdtRows(
-        tableName,
-        rowIds,
-        'reinserted',
+      final crdtDataRows = await _touchCrdtRows(
+        await _context.findRequiredCrdtRows(
+          tableName,
+          rowIds,
+          'reinserted',
+          transaction,
+        ),
+        hlcManager,
         transaction,
       );
-
-      await _touchCrdtRows(crdtDataRows, hlcManager, transaction);
+      // A reinsert authors the complete row at its new insertion timestamp.
+      // Retain attempted values while projecting, but discard their old ages.
+      await _context.resetReinsertedFieldClocks(crdtDataRows, transaction);
       await _context.markCrdtRowsDeleted(
         crdtDataRows,
         false,
         CrdtDataDeletedReason.userReinsert,
         transaction,
       );
-      // Every field to skip carries an attempted value: a repaired foreign key
-      // and a restored authored value are both subsets of that set, over a
-      // subset of its columns.
-      final skippedFields = await _foreignKeyProjector.findActiveAttemptedFields(
-        tableName: tableName,
-        rowIds: rowIds,
-        transaction: transaction,
-      );
-      // Reinsert is a full-row passthrough. Projected unique/FK columns must
-      // keep their original claim HLC so restoration can reclaim or lose
-      // without authoring a newer unique claim.
-      await _recordUpdatedFields(
-        reinsertedRows,
-        crdtDataRows,
-        null,
-        transaction,
-        skippedFields: skippedFields,
-      );
       await _maybeProject(tableName, rowIds, null, transaction);
+      // Only projected fields need a metadata row to hold their authored value.
+      // All other fields now inherit the insertion timestamp implicitly.
+      await CrdtDataField.db.deleteWhere(
+        _session,
+        where: (t) =>
+            t.rowId.inSet(crdtDataRows.map((row) => row.id!).toSet()) &
+            t.attemptedValue.id.equals(null),
+        transaction: transaction,
+        noReturn: true,
+      );
     });
   }
 
@@ -967,14 +964,14 @@ class CrdtMutationRecorder {
     );
   }
 
-  Future<void> _touchCrdtRows(
+  Future<List<CrdtDataRow>> _touchCrdtRows(
     List<CrdtDataRow> rows,
     HlcManager hlcManager,
     Transaction transaction,
   ) async {
-    if (rows.isEmpty) return;
+    if (rows.isEmpty) return [];
 
-    await CrdtDataRow.db.update(
+    return CrdtDataRow.db.update(
       _session,
       [for (final row in rows) _context.withNextHlc(row, hlcManager)],
       columns: (t) => [t.nodeId, t.hlcDatetime, t.hlcCounter],

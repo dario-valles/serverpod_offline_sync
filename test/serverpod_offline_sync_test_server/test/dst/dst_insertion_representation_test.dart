@@ -120,7 +120,7 @@ void main() {
   });
 
   group(
-    'Given a visible projected town restored with an older authored FK clock, ',
+    'Given a visible projected town restored with a renewed authored FK clock, ',
     () {
       late UuidValue space;
       late DstReplica receiver;
@@ -202,7 +202,7 @@ void main() {
           before.tombstones[rowKey]!.reason,
           CrdtDataDeletedReason.userReinsert,
         );
-        expect(before.fieldHlc(key)! < before.rowHlcs[rowKey]!, isTrue);
+        expect(before.fieldHlc(key), before.rowHlcs[rowKey]);
         operations = DstOperations(DstRandom(82), ids);
         operations.oracle.accept(before);
       });

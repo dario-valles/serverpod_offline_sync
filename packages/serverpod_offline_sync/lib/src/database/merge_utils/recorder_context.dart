@@ -278,6 +278,32 @@ WHERE r."spaceId" = $spaceId AND r."tblId" = $childTableId
     );
   }
 
+  /// Reauthors existing fields at their row's newly persisted insertion HLC.
+  ///
+  /// This runs before reprojection so unique claims use their new age. Updating
+  /// in place preserves attempted values whose foreign key cascades on field
+  /// deletion. [rows] carries the newly stamped metadata returned by the row
+  /// update, so no field or domain reads are needed. Ordinary field records can
+  /// be removed once projection is complete.
+  Future<void> resetReinsertedFieldClocks(
+    List<CrdtDataRow> rows,
+    Transaction transaction,
+  ) async {
+    for (final row in rows) {
+      await CrdtDataField.db.updateWhere(
+        databaseSession,
+        columnValues: (t) => [
+          t.nodeId(row.nodeId),
+          t.hlcDatetime(row.hlcDatetime),
+          t.hlcCounter(row.hlcCounter),
+        ],
+        where: (t) => t.rowId.equals(row.id),
+        transaction: transaction,
+        noReturn: true,
+      );
+    }
+  }
+
   Future<void> recordFieldsUpdatedByTable(
     String tableName,
     Set<UuidValue> rowIds,
@@ -651,6 +677,16 @@ WHERE (${domainColumnPredicate('spaceId', spaceId)})
     };
   }
 
+  /// Encodes model or merge values using the same column-aware encoder as ORM
+  /// writes. The generated column retains semantics such as DateTime, Duration,
+  /// binary data, and structured JSON that a SQL storage type alone cannot.
+  String encodeDomainColumnValue(String tableName, String columnName, Object? value) {
+    final column = syncTableByName[tableName]!.columns.singleWhere(
+      (column) => column.columnName == columnName,
+    );
+    return ValueEncoder.instance.encodeColumnValue(column, value);
+  }
+
   Future<void> updateDomainRows(
     String tableName,
     Set<UuidValue> rowIds,
@@ -660,7 +696,11 @@ WHERE (${domainColumnPredicate('spaceId', spaceId)})
     if (rowIds.isEmpty || updates.isEmpty) return;
 
     final assignments = updates.entries
-        .map((e) => '"${e.key.escapeIdentifier()}" = ${e.value.sqlLiteral()}')
+        .map(
+          (e) =>
+              '"${e.key.escapeIdentifier()}" = '
+              '${encodeDomainColumnValue(tableName, e.key, e.value)}',
+        )
         .join(', ');
 
     await database.unsafeExecute(

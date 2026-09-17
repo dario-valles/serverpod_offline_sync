@@ -1,5 +1,5 @@
 import 'package:serverpod_database/serverpod_database.dart'
-    show DatabaseQueryException, DatabaseUniqueViolationException;
+    show DatabaseQueryException, DatabaseUniqueViolationException, SqliteErrorCode;
 import 'package:serverpod_offline_sync_test_client/serverpod_offline_sync_test_client.dart';
 import 'package:test/test.dart';
 
@@ -515,18 +515,30 @@ void main() {
       'when a batch upsert restores the same identity twice without returning rows,',
       () {
         Object? failure;
+        Object? nativeFailure;
 
         setUp(() async {
           failure = null;
+          nativeFailure = null;
+          final writes = [
+            deleted.copyWith(name: 'first-write'),
+            deleted.copyWith(name: 'second-write'),
+          ];
+          try {
+            await node.raw.db.upsert(
+              writes,
+              conflictColumns: [Unique.t.id],
+              noReturn: true,
+            );
+          } on Object catch (error) {
+            nativeFailure = error;
+          }
           try {
             await node.offlineSync.db.transactionForUser(
               testCrdtUserId,
               (tx) => Unique.db.upsert(
                 node.offlineSync,
-                [
-                  deleted.copyWith(name: 'first-write'),
-                  deleted.copyWith(name: 'second-write'),
-                ],
+                writes,
                 conflictColumns: (t) => [t.id],
                 noReturn: true,
                 transaction: tx,
@@ -552,6 +564,25 @@ void main() {
             expect(await _export(node), before);
           },
         );
+
+        test('then its error code matches an ordinary SQLite batch upsert.', () {
+          expect(
+            nativeFailure,
+            isA<DatabaseQueryException>().having(
+              (error) => error.code,
+              'code',
+              SqliteErrorCode.integrityConstraintViolation,
+            ),
+          );
+          expect(
+            failure,
+            isA<DatabaseQueryException>().having(
+              (error) => error.code,
+              'code',
+              (nativeFailure! as DatabaseQueryException).code,
+            ),
+          );
+        });
       },
     );
   });

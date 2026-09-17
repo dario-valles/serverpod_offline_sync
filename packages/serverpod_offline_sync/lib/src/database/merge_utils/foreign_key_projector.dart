@@ -613,36 +613,6 @@ class CrdtForeignKeyProjector {
     };
   }
 
-  /// Fields that currently carry a sparse attempted-value override.
-  ///
-  /// Reinsert must not bump these field HLCs: the authored fact is unchanged
-  /// and the domain difference is projection.
-  Future<Set<MergeFieldKey>> findActiveAttemptedFields({
-    required String tableName,
-    required Set<UuidValue> rowIds,
-    required Transaction transaction,
-  }) async {
-    if (rowIds.isEmpty) return const {};
-
-    final columnNames = {
-      ..._foreignKeys.foreignKeyColumnsFor(tableName),
-      ..._uniqueResolver.uniqueColumnNamesFor(tableName),
-    };
-    if (columnNames.isEmpty) return const {};
-
-    final fields = await _loadFields(
-      tableName: tableName,
-      rowIds: rowIds,
-      columnNames: columnNames,
-      transaction: transaction,
-    );
-    return {
-      for (final field in fields)
-        if (field.attemptedValue != null)
-          (tableName, field.row!.uuidRowId, field.column!.name),
-    };
-  }
-
   /// Proves that an ordinary local write leaves the existing projection fixed.
   ///
   /// Only new, unreferenced rows and additions to null FKs qualify. All parents
@@ -2562,7 +2532,11 @@ class CrdtForeignKeyProjector {
         updates.entries.toList()..sort((a, b) => a.key.compareTo(b.key)),
       );
       final signature = sortedUpdates.entries
-          .map((entry) => '${entry.key}:${entry.value.sqlLiteral()}')
+          .map(
+            (entry) =>
+                '${entry.key}:'
+                '${_context.encodeDomainColumnValue(rowKey.$1, entry.key, entry.value)}',
+          )
           .join('\x1f');
       final groupKey = (rowKey.$1, signature);
 
