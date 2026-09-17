@@ -1,7 +1,11 @@
 ## Unreleased
 
-- feat: Let applications observe successful merges on the server through
-  `Serverpod.offlineSyncOnMergeSuccess` / `initializeOfflineSync(onMergeSuccess: ...)`.
+- feat: BREAKING. Report merges through a structured `OfflineSyncMergeEvent`
+  carrying the syncing user, space, peer node and the directional received and
+  sent HLCs. `onMergeSuccess` callbacks now take a single event argument.
+- feat: Register a server-wide merge handler with `pod.configureOfflineSync`.
+  It receives the sync session's `Session` alongside the event, runs in addition
+  to any per-sync observer, and is isolated from the committed synchronization.
 
 ## 0.0.8
 
