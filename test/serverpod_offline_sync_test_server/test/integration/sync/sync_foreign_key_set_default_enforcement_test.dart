@@ -1,3 +1,5 @@
+import 'package:serverpod_database/serverpod_database.dart'
+    show DatabaseUniqueViolationException;
 import 'package:serverpod_offline_sync_server/serverpod_offline_sync_server.dart';
 import 'package:serverpod_offline_sync_test_client/serverpod_offline_sync_test_client.dart';
 import 'package:test/test.dart';
@@ -43,15 +45,21 @@ void main() {
     group('when inserting another child with the same reference locally,', () {
       late List<UniqueSetDefaultChild> nodeRows;
       late CrdtMergeSet changes;
+      late Object? failure;
 
       setUpAll(() async {
-        await node.offlineSync.db.transactionForUser(testCrdtUserId, (tx) async {
-          await UniqueSetDefaultChild.db.insertRow(
-            node.offlineSync,
-            second,
-            transaction: tx,
-          );
-        });
+        failure = null;
+        try {
+          await node.offlineSync.db.transactionForUser(testCrdtUserId, (tx) async {
+            await UniqueSetDefaultChild.db.insertRow(
+              node.offlineSync,
+              second,
+              transaction: tx,
+            );
+          });
+        } on Object catch (error) {
+          failure = error;
+        }
 
         nodeRows = await UniqueSetDefaultChild.db.find(node.offlineSync);
         changes = await node.sync
@@ -62,24 +70,22 @@ void main() {
             .toList();
       });
 
-      test('then both child rows remain visible.', () {
-        expect(nodeRows.map((row) => row.id).toSet(), {first.id, second.id});
+      test('then the database rejects the occupied reference.', () {
+        expect(failure, isA<DatabaseUniqueViolationException>());
       });
 
-      test('then exactly one child retains the unique default reference.', () {
-        expect(nodeRows.where((row) => row.parentId == parent.id), hasLength(1));
-        expect(nodeRows.where((row) => row.parentId == null), hasLength(1));
+      test('then only the original child retains the unique default reference.', () {
+        expect(nodeRows.map((row) => row.id), [first.id]);
+        expect(nodeRows.single.parentId, parent.id);
       });
 
-      test('then both exported inserts retain their authored parent.', () {
+      test('then the rejected child has no exported facts.', () {
+        expect(changes.where((change) => change.uuidRowId == second.id), isEmpty);
         final claims = changes.whereType<CrdtMergeInsert>().where(
           (change) => change.tableName == UniqueSetDefaultChild.t.tableName,
         );
-        expect(claims, hasLength(2));
-        expect(
-          claims.map((change) => (change.data as UniqueSetDefaultChild).parentId),
-          everyElement(parent.id),
-        );
+        expect(claims, hasLength(1));
+        expect((claims.single.data as UniqueSetDefaultChild).parentId, parent.id);
       });
     });
   });
@@ -116,14 +122,20 @@ void main() {
       group('when inserting both children in one batch,', () {
         late List<UniqueSetDefaultChild> nodeRows;
         late CrdtMergeSet changes;
+        late Object? failure;
 
         setUpAll(() async {
-          await node.offlineSync.db.transactionForUser(testCrdtUserId, (tx) async {
-            await UniqueSetDefaultChild.db.insert(node.offlineSync, [
-              first,
-              second,
-            ], transaction: tx);
-          });
+          failure = null;
+          try {
+            await node.offlineSync.db.transactionForUser(testCrdtUserId, (tx) async {
+              await UniqueSetDefaultChild.db.insert(node.offlineSync, [
+                first,
+                second,
+              ], transaction: tx);
+            });
+          } on Object catch (error) {
+            failure = error;
+          }
 
           nodeRows = await UniqueSetDefaultChild.db.find(node.offlineSync);
           changes = await node.sync
@@ -134,23 +146,20 @@ void main() {
               .toList();
         });
 
-        test('then both child rows remain visible.', () {
-          expect(nodeRows.map((row) => row.id).toSet(), {first.id, second.id});
+        test('then the database rejects the duplicate batch reference.', () {
+          expect(failure, isA<DatabaseUniqueViolationException>());
         });
 
-        test('then exactly one child retains the unique default reference.', () {
-          expect(nodeRows.where((row) => row.parentId == parent.id), hasLength(1));
-          expect(nodeRows.where((row) => row.parentId == null), hasLength(1));
+        test('then neither child remains visible.', () {
+          expect(nodeRows, isEmpty);
         });
 
-        test('then both exported inserts retain their authored parent.', () {
-          final claims = changes.whereType<CrdtMergeInsert>().where(
-            (change) => change.tableName == UniqueSetDefaultChild.t.tableName,
-          );
-          expect(claims, hasLength(2));
+        test('then neither child has exported facts.', () {
           expect(
-            claims.map((change) => (change.data as UniqueSetDefaultChild).parentId),
-            everyElement(parent.id),
+            changes.where(
+              (change) => change.tableName == UniqueSetDefaultChild.t.tableName,
+            ),
+            isEmpty,
           );
         });
       });

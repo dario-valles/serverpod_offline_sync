@@ -68,8 +68,28 @@ independently of the database dialect.
 Create or update the row whenever the final domain value differs from the
 authored value. Remove it only when the domain value again equals the authored
 value and no projector still needs an override. At that point the domain column
-itself safely carries the authored value. No changes to the `CrdtDataField`
-existence policy, which is whenever its HLC is newer than the row HLC.
+itself safely carries the authored value. A `CrdtDataField` row is needed when
+its HLC is newer than the row HLC or it holds a preserved attempted value.
+Otherwise the field inherits the row's insertion HLC.
+
+### Reinserting a deleted row
+
+Inserting or upserting a deleted row keeps its identity and ownership and
+advances its delete/restore generation. The complete row is authored at a new
+insertion HLC, including preserved conflict claims, so unique claims receive
+a new age. This is a full-row write even when the upsert supplies an update
+column filter or predicate: those restrictions apply to visible existing rows.
+
+Old field timestamps are removed. Only metadata needed to preserve a projected
+value remains, at that same insertion HLC; deleting that metadata would cascade
+to the only stored copy of its authored value. Projection uses the renewed
+claim ages before redundant field records are removed.
+
+Outbound sync sends the full authored row without redundant field updates.
+Existing receivers still compare each field's HLC, so newer concurrent edits
+survive. The delete/restore generation is never reset, preventing an older
+deletion from hiding the restored row. These changes are atomic with the domain
+write and roll back together on failure.
 
 ### Diagnostic projection reason
 
@@ -151,8 +171,9 @@ must be FK-safe; under the current policy the FK is nullable and releases to
 
 Local insert, update, upsert, delete, and tombstone restoration need this plan
 before the underlying write can violate an immediate unique constraint. A
-full-row passthrough of an existing projected value remains non-authored;
-explicit/narrowed field writes author a new attempted value and field HLC.
+full-row passthrough translates an unchanged projected value back to its
+preserved authored value; explicit/narrowed field writes author the supplied
+value. Reinsertion follows the full-row reauthoring rule above.
 
 ## Outbound and rebuild behavior
 

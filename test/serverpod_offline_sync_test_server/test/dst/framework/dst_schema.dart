@@ -1,10 +1,15 @@
+import 'dart:typed_data';
+
 import 'package:serverpod_database/serverpod_database.dart' as db;
 import 'package:serverpod_offline_sync_server/serverpod_offline_sync_server.dart';
 import 'package:serverpod_offline_sync_test_client/serverpod_offline_sync_test_client.dart'
     as models;
+import 'package:serverpod_offline_sync_test_shared/serverpod_offline_sync_test_shared.dart'
+    as shared;
 
 /// Models whose domain rows the simulation authors and compares.
 enum DstTable {
+  types('types'),
   city('city'),
   person('person'),
   town('town'),
@@ -36,7 +41,9 @@ enum DstTable {
   fkChainSetNullMiddle('fk_chain_set_null_middle'),
   fkChainSetNullCascadeChild('fk_chain_set_null_cascade_child'),
   fkChainSetNullRestrictChild('fk_chain_set_null_restrict_child'),
-  fkChainSetNullSetNullChild('fk_chain_set_null_set_null_child');
+  fkChainSetNullSetNullChild('fk_chain_set_null_set_null_child'),
+  sharedParent('shared_parent'),
+  sharedChild('shared_child');
 
   const DstTable(this.tableName);
   final String tableName;
@@ -55,8 +62,13 @@ class DstModel<T extends db.TableRow<models.UuidValue?>> {
     db.DatabaseSession session, {
     db.Transaction? transaction,
     bool includeHidden = false,
+    models.UuidValue? spaceUuid,
   }) => session.db.find<T>(
-    where: includeHidden ? table.includeHiddenRows : null,
+    where: spaceUuid == null
+        ? (includeHidden ? table.includeHiddenRows : null)
+        : includeHidden
+        ? table.includeHiddenRows & table.spaceEquals(spaceUuid)
+        : table.spaceEquals(spaceUuid),
     transaction: transaction,
   );
 
@@ -118,9 +130,7 @@ class DstModel<T extends db.TableRow<models.UuidValue?>> {
         if (values.containsKey(column.columnName))
           db.ColumnValue(
             column,
-            column is db.ColumnUuid && values[column.columnName] != null
-                ? models.UuidValue.withValidation(values[column.columnName] as String)
-                : values[column.columnName],
+            _columnValue(column, values[column.columnName]),
           ),
     ],
     transaction: tx,
@@ -134,6 +144,18 @@ class DstModel<T extends db.TableRow<models.UuidValue?>> {
 }
 
 final dstModels = <DstTable, DstModel<db.TableRow<models.UuidValue?>>>{
+  DstTable.sharedParent: DstModel<shared.SharedParent>(
+    table: shared.SharedParent.t,
+    fromJson: shared.SharedParent.fromJson,
+  ),
+  DstTable.sharedChild: DstModel<shared.SharedChild>(
+    table: shared.SharedChild.t,
+    fromJson: shared.SharedChild.fromJson,
+  ),
+  DstTable.types: DstModel<models.Types>(
+    table: models.Types.t,
+    fromJson: models.Types.fromJson,
+  ),
   DstTable.city: DstModel<models.City>(
     table: models.City.t,
     fromJson: models.City.fromJson,
@@ -264,7 +286,68 @@ final dstModels = <DstTable, DstModel<db.TableRow<models.UuidValue?>>>{
   ),
 };
 
-/// A small, deterministic claim alphabet, independent of row identity.
+/// updateWhere accepts Dart values, whereas generated model maps contain JSON.
+Object? _columnValue(db.Column column, Object? value) {
+  if (value == null) return null;
+  return switch (column) {
+    db.ColumnUuid() => models.UuidValueJsonExtension.fromJson(value),
+    db.ColumnDateTime() => models.DateTimeJsonExtension.fromJson(value),
+    db.ColumnBigInt() => models.BigIntJsonExtension.fromJson(value),
+    db.ColumnByteData() => models.ByteDataJsonExtension.fromJson(value),
+    db.ColumnEnum<models.TypesEnum>() => models.TypesEnum.fromJson(value as int),
+    db.ColumnEnum<shared.SharedFlavor>() => shared.SharedFlavor.fromJson(
+      value as String,
+    ),
+    db.ColumnSerializable() ||
+    db.ColumnStructured() => models.Protocol().deserialize<dynamic>(value, column.type),
+    _ => value,
+  };
+}
+
+/// JSON inputs for the remaining typed columns in the generated model catalog.
+/// Finite reals, UTC instants, wide integers, and variable-size binary values
+/// exercise ordinary persisted values without adding invalid ORM inputs.
+Object dstTypedScalarJson(String? dartType, int sample) =>
+    switch (dartType?.replaceAll('?', '')) {
+      'bool' => sample.isEven,
+      'DateTime' => DateTime.utc(
+        2026,
+        1,
+        1,
+      ).add(Duration(milliseconds: sample * 1001)).toIso8601String(),
+      'BigInt' => (BigInt.parse('9007199254740993') + BigInt.from(sample)).toString(),
+      'double' => (sample - 500) / 8.0,
+      'dart:typed_data:ByteData' => models.ByteDataJsonExtension(
+        ByteData.sublistView(
+          Uint8List.fromList([
+            for (var index = 0; index < sample % 17; index++) (sample + index) % 256,
+          ]),
+        ),
+      ).toJson(),
+      'protocol:TypesEnum' => sample % models.TypesEnum.values.length,
+      'serverpod_offline_sync_test_shared:SharedFlavor' =>
+        shared.SharedFlavor.values[sample % shared.SharedFlavor.values.length].toJson(),
+      'protocol:SyncDocument' => models.SyncDocument(
+        title: 'document-$sample',
+        enabled: sample.isEven,
+        numbers: [sample, -sample],
+      ).toJson(),
+      'List<int>' => [sample, -sample],
+      _ => throw StateError('No DST scalar value for $dartType'),
+    };
+
+/// Text claims remain text even when they resemble UUIDs. Letter case is
+/// significant for the generated SQLite TEXT unique indexes.
+const dstUniqueTextValues = [
+  'claim-0',
+  'claim-1',
+  'claim-2',
+  'claim-3',
+  '550e8400-e29b-41d4-a716-446655440111',
+  '550E8400-E29B-41D4-A716-446655440111',
+];
+
+/// A small, deterministic UUID claim alphabet, independent of row identity.
 const dstUniqueValues = [
   models.UuidValue.raw('660e8400-e29b-41d4-a716-446655440000'),
   models.UuidValue.raw('660e8400-e29b-41d4-a716-446655440001'),

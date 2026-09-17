@@ -1,9 +1,12 @@
+import 'package:serverpod_database/serverpod_database.dart'
+    show DatabaseUniqueViolationException;
 import 'package:serverpod_offline_sync_server/serverpod_offline_sync_server.dart';
 import 'package:serverpod_offline_sync_test_client/serverpod_offline_sync_test_client.dart';
 import 'package:test/test.dart';
 
 import '../test_tools/client_session.dart';
 import '../test_tools/crdt_probes.dart';
+import '../test_tools/sync_topology.dart';
 
 void main() {
   initTestClientSession();
@@ -17,37 +20,42 @@ void main() {
     );
   });
 
-  group(
-    'Given two local unique inserts that claim the same name in one write, ',
-    () {
-      late Unique first;
-      late Unique second;
+  group('Given two new records with the same unique name, ', () {
+    late Unique first;
+    late Unique second;
+
+    setUp(() {
+      first = Unique(id: const Uuid().v7obj(), name: 'shared-name');
+      second = Unique(id: const Uuid().v7obj(), name: 'shared-name');
+    });
+
+    group('when both records are inserted in one local batch, ', () {
+      Object? failure;
 
       setUp(() async {
-        first = Unique(id: const Uuid().v7obj(), name: 'shared-name');
-        second = Unique(id: const Uuid().v7obj(), name: 'shared-name');
-        await session.db.transactionForUser(testCrdtUserId, (tx) {
-          return Unique.db.insert(session, [first, second], transaction: tx);
-        });
+        failure = null;
+        try {
+          await session.db.transactionForUser(
+            testCrdtUserId,
+            (tx) => Unique.db.insert(session, [first, second], transaction: tx),
+          );
+        } on Object catch (error) {
+          failure = error;
+        }
       });
 
       test(
-        'when the insert completes, '
-        'then one row keeps the name and the other is released without failing.',
+        'then the database rejects the duplicate and retains neither record nor sync fact.',
         () async {
-          final rows = await Unique.db.find(session);
-          final names = {for (final row in rows) row.id: row.name};
-
-          expect(rows, hasLength(2));
-          expect(names.values, contains('shared-name'));
-          expect(
-            names.values,
-            contains(matches(RegExp(r'^shared-name__conflict__[0-9a-f-]+$'))),
-          );
+          expect(failure, isA<DatabaseUniqueViolationException>());
+          expect(await Unique.db.find(session), isEmpty);
+          expect(await _pendingInserts(offlineSync), isEmpty);
+          expect(await _pendingUpdates(offlineSync), isEmpty);
+          expect(await CrdtDataAttemptedValue.db.find(testSession), isEmpty);
         },
       );
-    },
-  );
+    });
+  });
 
   group(
     'Given two visible unique rows, ',
@@ -157,7 +165,7 @@ void main() {
   );
 
   group(
-    'Given a locally inserted unique loser whose domain name was released, ',
+    'Given an independently authored unique loser merged with an occupied name, ',
     () {
       late Unique winner;
       late Unique loser;
@@ -172,9 +180,11 @@ void main() {
           ),
         );
         loser = Unique(id: const Uuid().v7obj(), name: 'shared-name');
-        await session.db.transactionForUser(
-          testCrdtUserId,
-          (tx) => Unique.db.insertRow(session, loser, transaction: tx),
+        await mergeIndependentInsert(
+          session,
+          loser,
+          space: testCrdtUserId,
+          tables: [Unique.t],
         );
       });
 
