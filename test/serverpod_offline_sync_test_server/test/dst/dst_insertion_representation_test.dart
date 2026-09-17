@@ -9,6 +9,147 @@ import 'framework/dst_world.dart';
 
 void main() {
   initTestClientSession(createSessionPerTest: false);
+
+  group('Given a unique winner and a later independently authored competing claim, ', () {
+    late UuidValue space;
+    late DstReplica replica;
+    late DstOperations operations;
+    late UniqueOverlapping winner;
+    late UniqueOverlapping competitor;
+    late DstFieldKey claimKey;
+    late DstSnapshot before;
+
+    setUp(() async {
+      final random = DstRandom(85);
+      final ids = DstIds(random);
+      space = ids.next();
+      replica = await DstReplica.create(
+        name: 'winner',
+        spaceUuids: [space],
+        nodeUuid: ids.next(),
+        clock: DstClock().clock,
+      );
+      final peer = await DstReplica.create(
+        name: 'competitor',
+        spaceUuids: [space],
+        nodeUuid: ids.next(),
+        clock: DstClock().skewed(const Duration(milliseconds: 1)),
+      );
+      winner = UniqueOverlapping(id: ids.next(), first: 'a', second: 'b', third: 'c');
+      competitor = UniqueOverlapping(
+        id: ids.next(),
+        first: 'a',
+        second: 'b',
+        third: 'z',
+      );
+      await replica.withReplicaClock(
+        () => replica.session.db.transactionForUser(
+          space,
+          (tx) =>
+              UniqueOverlapping.db.insertRow(replica.session, winner, transaction: tx),
+        ),
+      );
+      await peer.withReplicaClock(
+        () => peer.session.db.transactionForUser(
+          space,
+          (tx) =>
+              UniqueOverlapping.db.insertRow(peer.session, competitor, transaction: tx),
+        ),
+      );
+      await replica.merge(await peer.collect(space), space);
+      before = await DstSnapshot.capture(replica);
+      claimKey = ('unique_overlapping', winner.id!, 'first');
+      expect(before.visible['unique_overlapping']![winner.id]!.columns['first'], 'a');
+      operations = DstOperations(random, ids);
+      operations.oracle.accept(before);
+    });
+
+    group('when the winner edits its third value in a full-row save, ', () {
+      late DstSnapshot after;
+
+      setUp(() async {
+        await operations.perform(
+          replica,
+          space,
+          table: DstTable.uniqueOverlapping,
+          action: DstAction.fullRowUpdate,
+          body: (tx, evidence, refusal) async {
+            final write = winner.copyWith(third: 'edited');
+            evidence.write('unique_overlapping', write.toJson());
+            await UniqueOverlapping.db.updateRow(
+              replica.session,
+              write,
+              transaction: tx,
+            );
+            return DstOperationOutcome.applied;
+          },
+        );
+        after = await DstSnapshot.capture(replica);
+      });
+
+      test(
+        'then its touched claim becomes newer and the competing record displays the name.',
+        () {
+          expect(after.fieldHlc(claimKey), greaterThan(before.fieldHlc(claimKey)!));
+          expect(after.authoredValue(claimKey), 'a');
+          expect(
+            after.visible['unique_overlapping']![winner.id]!.columns['first'],
+            'a__conflict__${winner.id}',
+          );
+          expect(
+            after.visible['unique_overlapping']![competitor.id]!.columns['first'],
+            'a',
+          );
+          expect(
+            after.visible['unique_overlapping']![winner.id]!.columns['third'],
+            'edited',
+          );
+          expect(operations.validationFailures, 0);
+        },
+      );
+    });
+
+    group('when the winner edits only its selected third column, ', () {
+      late DstSnapshot after;
+
+      setUp(() async {
+        await operations.perform(
+          replica,
+          space,
+          table: DstTable.uniqueOverlapping,
+          action: DstAction.update,
+          body: (tx, evidence, refusal) async {
+            final write = winner.copyWith(third: 'edited');
+            evidence.write('unique_overlapping', write.toJson(), columns: {'third'});
+            await UniqueOverlapping.db.updateRow(
+              replica.session,
+              write,
+              columns: (t) => [t.third],
+              transaction: tx,
+            );
+            return DstOperationOutcome.applied;
+          },
+        );
+        after = await DstSnapshot.capture(replica);
+      });
+
+      test('then its excluded claim keeps its age and still displays the name.', () {
+        expect(after.fieldHlc(claimKey), before.fieldHlc(claimKey));
+        expect(after.authoredValue(claimKey), 'a');
+        expect(after.visible['unique_overlapping']![winner.id]!.columns['first'], 'a');
+        expect(
+          after.visible['unique_overlapping']![competitor.id]!.columns['first'],
+          'a__conflict__${competitor.id}',
+        );
+        expect(
+          after.visible['unique_overlapping']![winner.id]!.columns['third'],
+          'edited',
+        );
+        expect(operations.validationFailures, 0);
+      });
+    });
+  });
+
   group('Given a visible projected town with a generation-one insertion marker, ', () {
     late UuidValue space;
     late DstReplica receiver;
