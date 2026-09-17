@@ -260,6 +260,10 @@ fundamental to the design and can never be lifted.
   belong to sync projection; new claims throw `OfflineSyncReservedValueException`.
   Full-record saves can echo an unchanged displayed alternative while retaining
   the original claim. Non-unique text fields are unrestricted.
+- Non-nullable unique UUID columns that are not foreign keys reserve version 8
+  for generated alternatives. Authoring a version-8 value throws
+  `OfflineSyncReservedValueException`; primary keys, foreign keys, nullable UUID
+  columns, and non-unique UUID columns are unrestricted by this rule.
 - All 1:1 relations must have the foreign-key column nullable (`optional`
   relation).
 - The only allowed non-synced-to-synced relation is `spaceId -> offline_sync_spaces.id`.
