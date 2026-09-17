@@ -1,3 +1,8 @@
+## Unreleased
+
+- feat: Add `Session.offlineSyncDb`, which also resolves the CRDT-aware
+  database under `serverpod_test`, where `Session.db` is a proxy.
+
 ## 0.0.7
 
 - fix: Keep non-synced `updateRow` calls in the test harness transaction.
