@@ -11,6 +11,83 @@ import 'framework/dst_world.dart';
 void main() {
   initTestClientSession(createSessionPerTest: false);
 
+  group('Given a child whose former parent is deleted, ', () {
+    late DstReplica replica;
+    late DstOperations operations;
+    late UuidValue space;
+    late Person parent;
+    late UniqueSetNullChild child;
+    late City earlier;
+    late DstSnapshot before;
+
+    setUp(() async {
+      final random = DstRandom(48);
+      final ids = DstIds(random);
+      space = ids.next();
+      replica = await _replica(ids, [space]);
+      operations = DstOperations(random, ids);
+      parent = Person(id: ids.next(), name: 'deleted parent');
+      child = UniqueSetNullChild(id: ids.next(), name: 'child', parentId: parent.id);
+      earlier = City(id: ids.next(), name: 'rolled back');
+      await replica.withReplicaClock(
+        () => replica.session.db.transactionForUser(space, (tx) async {
+          await Person.db.insertRow(replica.session, parent, transaction: tx);
+          await UniqueSetNullChild.db.insertRow(
+            replica.session,
+            child,
+            transaction: tx,
+          );
+          await Person.db.deleteRow(replica.session, parent, transaction: tx);
+        }),
+      );
+      before = await DstSnapshot.capture(replica);
+    });
+
+    group(
+      'when a save resubmits the deleted parent after an earlier valid write, ',
+      () {
+        late DstOperationOutcome outcome;
+        late DstSnapshot after;
+
+        setUp(() async {
+          outcome = await operations.perform(
+            replica,
+            space,
+            table: DstTable.uniqueSetNullChild,
+            action: DstAction.fullRowUpdate,
+            body: (tx, evidence, refusal) async {
+              evidence.write('city', earlier.toJson());
+              await City.db.insertRow(replica.session, earlier, transaction: tx);
+              final write = child.copyWith(name: 'resubmitted');
+              evidence.write('unique_set_null_child', write.toJson());
+              await UniqueSetNullChild.db.updateRow(
+                replica.session,
+                write,
+                transaction: tx,
+              );
+              return DstOperationOutcome.applied;
+            },
+          );
+          after = await DstSnapshot.capture(replica);
+        });
+
+        test('then the DST recognizes the refusal naming the parent by UUID.', () {
+          expect(outcome, DstOperationOutcome.rejected);
+          expect(operations.rejections, [
+            'Exception: Cannot reference deleted row person.id = ${parent.id}.',
+          ]);
+          expect(operations.appliedPaths, isEmpty);
+          expect(operations.unexpectedPaths, isEmpty);
+        });
+
+        test('then both writes roll back without changing authored state.', () {
+          expect(after.renderSpace(space), before.renderSpace(space));
+          expect(after.renderRawMetadata(), before.renderRawMetadata());
+        });
+      },
+    );
+  });
+
   group('Given visible unique rows claiming claim-0 through claim-3,', () {
     late DstIds ids;
     late UuidValue space;

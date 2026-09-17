@@ -912,9 +912,16 @@ WHERE c."id" IN ($whereRowIds)
     );
     if (result.isEmpty) return null;
 
+    final foreignKeyIndex = result.first[0] as int;
     return (
-      foreignKeyIndex: result.first[0] as int,
-      value: result.first[1] as Object,
+      foreignKeyIndex: foreignKeyIndex,
+      // Raw SQLite UUID columns are blobs; report the authored identifier.
+      value: canonicalDomainValue(
+        result.first[1],
+        columnsByTableAndName[childTableName]?[foreignKeys[foreignKeyIndex]
+            .columns
+            .single],
+      )!,
     );
   }
 
