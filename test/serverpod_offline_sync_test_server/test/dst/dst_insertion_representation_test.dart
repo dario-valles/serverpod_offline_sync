@@ -286,13 +286,19 @@ void main() {
               UniqueOverlapping.db.insertRow(replica.session, winner, transaction: tx),
         ),
       );
-      await replica.withReplicaClock(
-        () => replica.session.db.transactionForUser(
+      final peer = await DstReplica.create(
+        name: 'independent-claim',
+        spaceUuids: [space],
+        nodeUuid: ids.next(),
+        clock: DstClock().skewed(const Duration(milliseconds: 1)),
+      );
+      await peer.withReplicaClock(
+        () => peer.session.db.transactionForUser(
           space,
-          (tx) =>
-              UniqueOverlapping.db.insertRow(replica.session, loser, transaction: tx),
+          (tx) => UniqueOverlapping.db.insertRow(peer.session, loser, transaction: tx),
         ),
       );
+      await replica.merge(await peer.collect(space), space);
       before = await DstSnapshot.capture(replica);
       firstKey = ('unique_overlapping', loser.id!, 'first');
       secondKey = ('unique_overlapping', loser.id!, 'second');

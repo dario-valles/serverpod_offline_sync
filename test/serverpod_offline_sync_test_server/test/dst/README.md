@@ -175,6 +175,14 @@ composite, fixed-discriminator, overlapping, FK-only composite, and space-scoped
 FK/text claims. The unique oracle reads all declared tuple components and space.
 A null component releases the tuple, as in SQL.
 
+Locally observable unique collisions are expected refusals. The predictor uses
+the pre-operation visible rows and submitted values, including composite tuples
+and space partitions. It matches the violated index and checks that domain data,
+authored metadata, and sync progress all roll back. Unexpected constraint errors
+still fail the run. Conflict-resolution scenarios author competing claims on
+disconnected replicas and merge them, so only independently accepted claims
+enter arbitration.
+
 The operation generator can insert, update, delete, restore a retained identity,
 upsert, pass a full model back through update, insert/update/delete a batch,
 swap unique tuples atomically, and perform predicate updates/deletes. Scripted regressions

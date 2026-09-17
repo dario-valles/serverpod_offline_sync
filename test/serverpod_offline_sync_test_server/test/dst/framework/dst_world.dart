@@ -351,9 +351,14 @@ class DstOperations {
         final blockers = [
           ...refusal.deleteReasons(definiteOnly: true),
           ...refusal.reservedValueReasons(evidence),
+          ...refusal.uniqueReasons(evidence),
         ];
         if (blockers.isNotEmpty) {
-          throw StateError('Blocked $path unexpectedly committed: $blockers');
+          throw StateError(
+            'Blocked $path unexpectedly committed: $blockers\n'
+            'Before:\n${before.renderSpace(spaceUuid)}\n'
+            'Inputs: ${evidence.domainValues}\nAfter:\n${after.renderSpace(spaceUuid)}',
+          );
         }
         final violations = [
           ...evidence.validate(after),

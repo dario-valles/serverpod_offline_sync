@@ -525,6 +525,7 @@ class OfflineSyncDatabase implements Database {
       rowsToReinsert,
       null,
       transaction,
+      restoring: true,
     );
     final reinsertedRows = await _delegate.update<T>(
       plannedReinserts.rows,

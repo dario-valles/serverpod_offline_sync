@@ -787,6 +787,8 @@ class CrdtForeignKeyProjector {
   /// authored value of existing rows before planning. When [materialize] is
   /// false, only the in-memory plan is computed so a later physical insert is
   /// not blocked by this rebuild.
+  /// Local writes preserve proposed visible unique values for database
+  /// constraint enforcement; only merge/rebuild passes arbitrate new conflicts.
   ///
   /// [seedTables] names the tables this pass changed. Only their foreign key
   /// components are loaded, which is equivalent to a full pass because no
@@ -799,6 +801,8 @@ class CrdtForeignKeyProjector {
     Set<String>? seedTables,
     Set<MergeRowKey>? seedRows,
     bool materialize = true,
+    bool localWrite = false,
+    Set<MergeRowKey> restoringRows = const {},
   }) async {
     final state = await _loadProjectionState(
       transaction,
@@ -842,6 +846,8 @@ class CrdtForeignKeyProjector {
       finalHidden: finalHidden,
       authoredOverlays: authoredOverlays,
       materialize: materialize,
+      localWrite: localWrite,
+      restoringRows: restoringRows,
       transaction: transaction,
     );
   }
@@ -2115,6 +2121,8 @@ class CrdtForeignKeyProjector {
     required Set<MergeRowKey> finalHidden,
     required Map<MergeFieldKey, Object?> authoredOverlays,
     required bool materialize,
+    required bool localWrite,
+    required Set<MergeRowKey> restoringRows,
     required Transaction transaction,
   }) async {
     final authoredByField = _authoredValuesByField(state, authoredOverlays);
@@ -2133,6 +2141,25 @@ class CrdtForeignKeyProjector {
       }
     }
 
+    if (localWrite) {
+      // Keep locally observable unique values until the physical write has
+      // passed its constraints. An unchanged projected field carries its
+      // current domain value; a selected field carries the caller's value.
+      // Resolving a new conflict here would hide a violation from the database.
+      for (final row in state.rows.values) {
+        if (state.pendingInsertKeys.contains(row.key)) continue;
+        for (final column in _uniqueResolver.uniqueColumnNamesFor(row.key.$1)) {
+          final key = (row.key.$1, row.key.$2, column);
+          row.values[column] = canonicalDomainValue(
+            authoredOverlays.containsKey(key)
+                ? authoredOverlays[key]
+                : state.originalDomain[row.key]?[column],
+            _context.columnsByTableAndName[row.key.$1]?[column],
+          );
+        }
+      }
+    }
+
     final uniqueReasons = _uniqueResolver.planUniqueProjection(
       valuesByRow: {
         for (final row in state.rows.values) row.key: row.values,
@@ -2140,10 +2167,13 @@ class CrdtForeignKeyProjector {
       crdtRows: {
         for (final row in state.rows.values) row.key: row.crdtRow,
       },
-      hidden: finalHidden,
+      // Restores must pass the physical unique constraint before their
+      // tombstones are lifted. Releasing these inputs would hide collisions.
+      hidden: finalHidden.difference(restoringRows),
       authoredByField: authoredByField,
       claimByField: claimByField,
       fieldHlcs: state.fieldHlcs,
+      resolveVisibleConflicts: !localWrite,
     );
 
     final terminalReasons = <MergeFieldKey, CrdtProjectionReason>{

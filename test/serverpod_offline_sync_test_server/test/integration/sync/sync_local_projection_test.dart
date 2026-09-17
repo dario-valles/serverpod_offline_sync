@@ -501,7 +501,7 @@ void main() {
         );
       });
 
-      group('when the fallback and another claimant are inserted locally,', () {
+      group('when the fallback is inserted and an independent claimant is merged,', () {
         late UniqueSetDefaultChild claimant;
         late List<UniqueSetDefaultChild> rows;
         late Map<UuidValue?, UuidValue?> authoredParents;
@@ -518,12 +518,32 @@ void main() {
               Town(id: fallbackId, name: 'fallback'),
               transaction: tx,
             );
+          });
+
+          final peer = await syncNode(
+            await createAdditionalTestSession(),
+            testSyncTables,
+          );
+          await peer.offlineSync.db.transactionForUser(testCrdtUserId, (tx) async {
+            await Town.db.insertRow(
+              peer.offlineSync,
+              Town(id: fallbackId, name: 'fallback'),
+              transaction: tx,
+            );
             await UniqueSetDefaultChild.db.insertRow(
-              node.offlineSync,
+              peer.offlineSync,
               claimant,
               transaction: tx,
             );
           });
+
+          final peerFacts = await peer.sync
+              .collectPendingChanges(
+                peer.raw,
+                checkpointsBySpaceUuid: {testCrdtUserId: const []},
+              )
+              .toList();
+          await node.offlineSync.db.mergeChanges(peerFacts, spaceId: testCrdtUserId);
 
           rows = await UniqueSetDefaultChild.db.find(node.offlineSync);
           final facts = await node.sync

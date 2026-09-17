@@ -14,6 +14,10 @@ class DstWriteEvidence {
 
   final DstSnapshot before;
   final Map<DstFieldKey, Object?> values = {};
+
+  /// Submitted domain values, before unchanged projections are translated
+  /// back to preserved claims. Local unique constraints see these values.
+  final Map<DstFieldKey, Object?> domainValues = {};
   final Map<String, bool> _visibilityChanges = {};
 
   void visibility(String table, Iterable<UuidValue> ids, {required bool deleted}) {
@@ -44,6 +48,7 @@ class DstWriteEvidence {
       final supplied = insertDefaults && data[column] == null && defaults.isNotEmpty
           ? defaults.single.defaultValue
           : data[column];
+      domainValues[key] = supplied;
       values[key] = passthrough ? before.authoredValue(key) : supplied;
     }
   }

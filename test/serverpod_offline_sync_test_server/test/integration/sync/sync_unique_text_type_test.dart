@@ -21,8 +21,13 @@ void main() {
       loser = Unique(id: const Uuid().v7obj(), name: value);
       await source.offlineSync.db.transactionForUser(testCrdtUserId, (tx) async {
         await Unique.db.insertRow(source.offlineSync, winner, transaction: tx);
-        await Unique.db.insertRow(source.offlineSync, loser, transaction: tx);
       });
+      await mergeIndependentInsert(
+        source.offlineSync,
+        loser,
+        space: testCrdtUserId,
+        tables: [Unique.t],
+      );
     });
 
     group('when an empty peer bootstraps and the original winner is deleted, ', () {
@@ -57,8 +62,13 @@ void main() {
       loser = UniqueUuid(id: const Uuid().v7obj(), value: value);
       await source.offlineSync.db.transactionForUser(testCrdtUserId, (tx) async {
         await UniqueUuid.db.insertRow(source.offlineSync, winner, transaction: tx);
-        await UniqueUuid.db.insertRow(source.offlineSync, loser, transaction: tx);
       });
+      await mergeIndependentInsert(
+        source.offlineSync,
+        loser,
+        space: testCrdtUserId,
+        tables: [UniqueUuid.t],
+      );
     });
 
     group('when an empty peer bootstraps and the original winner is deleted, ', () {

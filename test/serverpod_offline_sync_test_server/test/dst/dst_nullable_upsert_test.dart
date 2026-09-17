@@ -4,6 +4,7 @@ import 'package:serverpod_offline_sync_test_client/serverpod_offline_sync_test_c
 import 'package:test/test.dart';
 
 import '../integration/test_tools/client_session.dart';
+import '../integration/test_tools/sync_topology.dart';
 
 typedef _Replica = ({
   ClientDatabaseSession raw,
@@ -75,20 +76,18 @@ void main() {
         transaction: tx,
       ),
     );
-    await node.session.db.transactionForUser(
-      space,
-      (tx) => UniqueNullable.db.insertRow(
-        node.session,
-        UniqueNullable(id: loser, value: value),
-        transaction: tx,
-      ),
+    await mergeIndependentInsert(
+      node.session,
+      UniqueNullable(id: loser, value: value),
+      space: space,
+      tables: [UniqueNullable.t],
     );
     return (winner, loser);
   }
 
   test(
     'Given two rows claiming the same nullable unique value, '
-    'when the later claim is authored, '
+    'when an independently authored later claim is merged, '
     'then the loser stays visible with a released column and a preserved claim.',
     () async {
       final space = const Uuid().v7obj();

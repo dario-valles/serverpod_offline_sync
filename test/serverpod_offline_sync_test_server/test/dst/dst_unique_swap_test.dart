@@ -3,6 +3,7 @@ import 'package:serverpod_offline_sync_test_client/serverpod_offline_sync_test_c
 import 'package:test/test.dart';
 
 import '../integration/test_tools/client_session.dart';
+import '../integration/test_tools/sync_topology.dart';
 
 void main() {
   initTestClientSession();
@@ -14,24 +15,13 @@ void main() {
 
     setUp(() async {
       space = const Uuid().v7obj();
-      final first = Unique(id: const Uuid().v7obj(), name: 'initial-0');
-      final second = Unique(id: const Uuid().v7obj(), name: 'initial-1');
+      final first = Unique(id: const Uuid().v7obj(), name: 'contested');
+      final second = Unique(id: const Uuid().v7obj(), name: 'contested');
       await session.db.transactionForUser(
         space,
-        (tx) => Unique.db.insert(session, [first, second], transaction: tx),
+        (tx) => Unique.db.insertRow(session, first, transaction: tx),
       );
-      await session.db.transactionForUser(
-        space,
-        (tx) => Unique.db.update(
-          session,
-          [
-            first.copyWith(name: 'contested'),
-            second.copyWith(name: 'contested'),
-          ],
-          columns: (t) => [t.name],
-          transaction: tx,
-        ),
-      );
+      await mergeIndependentInsert(session, second, space: space, tables: [Unique.t]);
       before = await _names();
       authoredBefore = await _authoredNames();
     });
@@ -87,26 +77,15 @@ void main() {
 
     setUp(() async {
       space = const Uuid().v7obj();
-      final first = Unique(id: const Uuid().v7obj(), name: 'initial-0');
-      final second = Unique(id: const Uuid().v7obj(), name: 'initial-1');
-      final third = Unique(id: const Uuid().v7obj(), name: 'initial-2');
+      final first = Unique(id: const Uuid().v7obj(), name: 'contested');
+      final second = Unique(id: const Uuid().v7obj(), name: 'contested');
       await session.db.transactionForUser(
         space,
-        (tx) => Unique.db.insert(session, [first, second, third], transaction: tx),
+        (tx) => Unique.db.insertRow(session, first, transaction: tx),
       );
-      await session.db.transactionForUser(
-        space,
-        (tx) => Unique.db.update(
-          session,
-          [
-            first.copyWith(name: 'contested'),
-            second.copyWith(name: 'contested'),
-            third.copyWith(name: 'contested'),
-          ],
-          columns: (t) => [t.name],
-          transaction: tx,
-        ),
-      );
+      await mergeIndependentInsert(session, second, space: space, tables: [Unique.t]);
+      final third = Unique(id: const Uuid().v7obj(), name: 'contested');
+      await mergeIndependentInsert(session, third, space: space, tables: [Unique.t]);
       before = await _names();
       authoredBefore = await _authoredNames();
     });

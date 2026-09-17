@@ -18,8 +18,13 @@ void main() {
       loser = UniqueNullable(id: const Uuid().v7obj(), value: 0);
       await source.offlineSync.db.transactionForUser(testCrdtUserId, (tx) async {
         await UniqueNullable.db.insertRow(source.offlineSync, winner, transaction: tx);
-        await UniqueNullable.db.insertRow(source.offlineSync, loser, transaction: tx);
       });
+      await mergeIndependentInsert(
+        source.offlineSync,
+        loser,
+        space: testCrdtUserId,
+        tables: [UniqueNullable.t],
+      );
     });
 
     group('when a full-row upsert writes 1 and an empty peer bootstraps, ', () {
@@ -173,12 +178,13 @@ void main() {
             winner,
             transaction: tx,
           );
-          await UniqueOverlapping.db.insertRow(
-            node.offlineSync,
-            loser,
-            transaction: tx,
-          );
         });
+        await mergeIndependentInsert(
+          node.offlineSync,
+          loser,
+          space: testCrdtUserId,
+          tables: [UniqueOverlapping.t],
+        );
       });
 
       group(

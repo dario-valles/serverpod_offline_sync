@@ -477,11 +477,10 @@ class CrdtMutationRecorder {
 
   /// Plans FK/unique projection for rows that are about to be inserted.
   ///
-  /// Releases hidden unique claims first and returns copies whose unique/FK
-  /// columns already hold the planned domain values, so the physical write
-  /// cannot violate an immediate unique index. Authored values that differ
-  /// from the planned domain are returned so they can be stored as attempted
-  /// values after the insert.
+  /// Releases hidden unique claims first and plans foreign key repairs while
+  /// preserving submitted unique values for database constraint enforcement.
+  /// Authored values that differ from the planned domain are returned so they
+  /// can be stored as attempted values after the insert.
   Future<({List<T> rows, ProjectionAttemptsByField attempts})>
   planLocalInserts<T extends TableRow>(
     List<T> rows,
@@ -528,6 +527,7 @@ class CrdtMutationRecorder {
     final planned = await _foreignKeyProjector.project(
       transaction,
       pendingInserts: pending,
+      localWrite: true,
       seedTables: {tableName},
       seedRows: {for (final row in pending) (tableName, row.rowId)},
     );
@@ -565,8 +565,9 @@ class CrdtMutationRecorder {
   planLocalUpdates<T extends TableRow>(
     List<T> rows,
     List<Column>? columns,
-    Transaction transaction,
-  ) async {
+    Transaction transaction, {
+    bool restoring = false,
+  }) async {
     if (rows.isEmpty) return (rows: rows, projectionUnchanged: true);
     final tableName = rows.first.table.tableName;
     if (!_context.isCrdtTrackedTableName(tableName)) {
@@ -619,6 +620,11 @@ class CrdtMutationRecorder {
     final planned = await _foreignKeyProjector.project(
       transaction,
       authoredOverlays: overlays,
+      localWrite: true,
+      restoringRows: {
+        if (restoring)
+          for (final row in rows) (tableName, row.id as UuidValue),
+      },
       seedTables: {tableName},
       seedRows: {
         for (final row in rows)

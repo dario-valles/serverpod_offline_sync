@@ -2,6 +2,7 @@ import 'package:serverpod_database/serverpod_database.dart' show TableRow;
 import 'package:serverpod_offline_sync_test_client/serverpod_offline_sync_test_client.dart';
 
 import 'dst_random.dart';
+import 'dst_snapshot.dart';
 import 'dst_world.dart';
 
 /// A per-space production-valid graph, followed by concrete transitions before
@@ -82,16 +83,14 @@ Future<void> populateDstSpace({
     columns: {'oldCompanyId'},
   );
 
-  // Exchange ordinary authored names before creating competing claims.
+  // Exchange distinct names, then exercise local uniqueness and reserved-name
+  // refusals. Competing claims arise only after independent replicas merge.
   await operations.apply(
     replica,
     space,
     table: DstTable.unique,
     action: DstAction.swapUnique,
   );
-  // Competing ordinary claims remain supported. Adopting a generated name in
-  // the following swap is an expected reserved-value refusal with rollback.
-  // Continue with the same identity's delete/restore/redelete lifecycle.
   await _write(
     replica,
     space,
@@ -102,12 +101,39 @@ Future<void> populateDstSpace({
     ],
     DstAction.updateBatch,
     columns: {'name'},
+    expected: DstOperationOutcome.rejected,
   );
-  await operations.apply(
+  final competing = await DstReplica.create(
+    name: '${replica.name}-independent-claim',
+    spaceUuids: [space],
+    nodeUuid: ids.next(),
+    clock: replica.clock,
+  );
+  final claimedName = (await Unique.db.findById(
+    replica.session,
+    rows[DstTable.unique]!.first.id!,
+  ))!.name;
+  await _write(competing, space, operations, DstTable.unique, [
+    Unique(id: ids.next(), name: claimedName),
+  ], DstAction.insertBatch);
+  await replica.merge(await competing.collect(space), space);
+  final merged = await DstSnapshot.capture(replica);
+  final violations = operations.observe(replica, merged);
+  if (violations.isNotEmpty) throw StateError('Populated unique merge: $violations');
+  await _write(
     replica,
     space,
-    table: DstTable.unique,
-    action: DstAction.swapUnique,
+    operations,
+    DstTable.unique,
+    [
+      Unique(
+        id: rows[DstTable.unique]!.first.id,
+        name: 'contested__conflict__${rows[DstTable.unique]!.first.id}',
+      ),
+    ],
+    DstAction.updateBatch,
+    columns: {'name'},
+    expected: DstOperationOutcome.rejected,
   );
   final identity = rows[DstTable.unique]!.first.id!;
   final current = await Unique.db.findById(replica.session, identity);
@@ -169,6 +195,7 @@ Future<void> _write(
   List<TableRow<UuidValue?>> rows,
   DstAction action, {
   Set<String>? columns,
+  DstOperationOutcome expected = DstOperationOutcome.applied,
 }) async {
   final outcome = await operations.perform(
     replica,
@@ -206,9 +233,9 @@ Future<void> _write(
       return DstOperationOutcome.applied;
     },
   );
-  if (outcome != DstOperationOutcome.applied) {
+  if (outcome != expected) {
     throw StateError(
-      'Populated ${table.tableName}.${action.name} did not commit: $outcome',
+      'Populated ${table.tableName}.${action.name} returned $outcome instead of $expected',
     );
   }
 }

@@ -21,9 +21,19 @@ void main() {
       final third = Unique(id: const Uuid().v7obj(), name: 'contested');
       await node.offlineSync.db.transactionForUser(testCrdtUserId, (tx) async {
         await Unique.db.insertRow(node.offlineSync, first, transaction: tx);
-        await Unique.db.insertRow(node.offlineSync, second, transaction: tx);
-        await Unique.db.insertRow(node.offlineSync, third, transaction: tx);
       });
+      await mergeIndependentInsert(
+        node.offlineSync,
+        second,
+        space: testCrdtUserId,
+        tables: [Unique.t],
+      );
+      await mergeIndependentInsert(
+        node.offlineSync,
+        third,
+        space: testCrdtUserId,
+        tables: [Unique.t],
+      );
       before = await _export(node);
       names = Map.fromEntries(
         (await Unique.db.find(

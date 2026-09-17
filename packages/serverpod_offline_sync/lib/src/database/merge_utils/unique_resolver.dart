@@ -123,6 +123,7 @@ class CrdtUniqueConflictResolver {
     required Map<MergeFieldKey, Object?> authoredByField,
     required Map<MergeFieldKey, Object?> claimByField,
     required Map<MergeFieldKey, Hlc> fieldHlcs,
+    bool resolveVisibleConflicts = true,
   }) {
     final reasons = <MergeFieldKey, CrdtProjectionReason>{};
     final tableNames = {for (final rowKey in valuesByRow.keys) rowKey.$1};
@@ -153,6 +154,9 @@ class CrdtUniqueConflictResolver {
           );
         }
 
+        // Local writes retain their proposed unique values so the database
+        // enforces uniqueness. Hidden rows still release their old values.
+        if (!resolveVisibleConflicts) continue;
         final groups = <String, List<MergeRowKey>>{};
         for (final rowKey in tableRowKeys) {
           if (hidden.contains(rowKey)) continue;

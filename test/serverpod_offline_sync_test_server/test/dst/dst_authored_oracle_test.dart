@@ -27,9 +27,17 @@ void main() {
       await replica.withReplicaClock(
         () => replica.session.db.transactionForUser(
           space,
-          (tx) => Unique.db.insert(replica.session, [first, second], transaction: tx),
+          (tx) => Unique.db.insertRow(replica.session, first, transaction: tx),
         ),
       );
+      final peer = await _replica(ids, space);
+      await peer.withReplicaClock(
+        () => peer.session.db.transactionForUser(
+          space,
+          (tx) => Unique.db.insertRow(peer.session, second, transaction: tx),
+        ),
+      );
+      await replica.merge(await peer.collect(space), space);
       final accepted = await DstSnapshot.capture(replica);
       expect(evidence.validate(accepted), isEmpty);
       final oracle = DstAuthoredOracle()..accept(accepted);

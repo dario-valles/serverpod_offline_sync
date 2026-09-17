@@ -20,6 +20,20 @@ This is the `flag` policy. It is intentionally simple:
 This policy is the only unique-conflict policy in space for the current
 implementation.
 
+## Local writes
+
+Local inserts, updates, upserts, and restores obey the database's unique
+constraints. Two records cannot claim the same occupied value or non-null
+composite tuple in one local write. The database enforces this against stored
+rows and other rows in the batch; no additional domain reads are needed to
+pre-check uniqueness. A rejected write rolls back its domain changes and sync
+metadata together. Ordinary `ignoreConflicts` and upsert predicates still apply.
+
+Claims accepted independently on disconnected replicas can still conflict when
+merged. The policy below preserves those accepted claims and chooses their
+visible values. Passing an unchanged displayed alternative through a full-row
+save preserves the underlying claim and follows the normal field-touch rules.
+
 ## Current Policy: Flag
 
 Candidate construction, hidden-row release, canonical attempted-value lookup,

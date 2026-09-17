@@ -11,88 +11,250 @@ import 'framework/dst_world.dart';
 void main() {
   initTestClientSession(createSessionPerTest: false);
 
-  for (final action in [
-    DstAction.insert,
-    DstAction.insertBatch,
-    DstAction.updateBatch,
-  ]) {
-    test(
-      'Given visible unique rows claiming claim-0 through claim-3, '
-      'when the DST performs a competing claim-0 ${action.name}, '
-      'then the supported write commits and preserves every authored claim.',
-      () async {
-        final random = DstRandom(43);
-        final ids = DstIds(random);
-        final space = ids.next();
-        final replica = await _replica(ids, [space]);
-        final operations = DstOperations(random, ids);
-        final originals = [
-          for (var i = 0; i < 4; i++) Unique(id: ids.next(), name: 'claim-$i'),
-        ];
-        await replica.withReplicaClock(
-          () => replica.session.db.transactionForUser(
-            space,
-            (tx) => Unique.db.insert(replica.session, originals, transaction: tx),
-          ),
-        );
+  group('Given visible unique rows claiming claim-0 through claim-3,', () {
+    late DstIds ids;
+    late UuidValue space;
+    late DstReplica replica;
+    late DstOperations operations;
+    late List<Unique> originals;
+    late DstSnapshot before;
 
-        final writes = action == DstAction.updateBatch
-            ? [
-                for (final row in originals.skip(1).take(2))
-                  row.copyWith(name: 'claim-0'),
-              ]
-            : [
-                for (var i = 0; i < (action == DstAction.insertBatch ? 2 : 1); i++)
-                  Unique(id: ids.next(), name: 'claim-0'),
-              ];
-        final outcome = await operations.perform(
+    setUp(() async {
+      final random = DstRandom(43);
+      ids = DstIds(random);
+      space = ids.next();
+      replica = await _replica(ids, [space]);
+      operations = DstOperations(random, ids);
+      originals = [
+        for (var i = 0; i < 4; i++) Unique(id: ids.next(), name: 'claim-$i'),
+      ];
+      await replica.withReplicaClock(
+        () => replica.session.db.transactionForUser(
+          space,
+          (tx) => Unique.db.insert(replica.session, originals, transaction: tx),
+        ),
+      );
+      before = await DstSnapshot.capture(replica);
+    });
+
+    group('when a new record claims an occupied name,', () {
+      late DstOperationOutcome outcome;
+      late DstSnapshot after;
+      setUp(() async {
+        final writes = [Unique(id: ids.next(), name: 'claim-0')];
+        outcome = await operations.perform(
           replica,
           space,
           table: DstTable.unique,
-          action: action,
+          action: DstAction.insert,
           body: (tx, evidence, refusal) async {
             for (final row in writes) {
               evidence.write('unique', row.toJson());
             }
-            if (action == DstAction.updateBatch) {
-              await Unique.db.update(
-                replica.session,
-                writes,
-                columns: (t) => [t.name],
-                transaction: tx,
-              );
-            } else if (action == DstAction.insertBatch) {
-              await Unique.db.insert(replica.session, writes, transaction: tx);
-            } else {
-              await Unique.db.insertRow(
-                replica.session,
-                writes.single,
-                transaction: tx,
-              );
-            }
+            await Unique.db.insertRow(replica.session, writes.single, transaction: tx);
             return DstOperationOutcome.applied;
           },
         );
-        final snapshot = await DstSnapshot.capture(replica);
+        after = await DstSnapshot.capture(replica);
+      });
+      test(
+        'then the refusal is predicted and all domain and authored state rolls back.',
+        () {
+          expect(outcome, DstOperationOutcome.rejected);
+          expect(operations.rejections, hasLength(1));
+          expect(operations.appliedPaths, isEmpty);
+          expect(after.renderSpace(space), before.renderSpace(space));
+          expect(after.renderRawMetadata(), before.renderRawMetadata());
+        },
+      );
+    });
 
-        expect(outcome, DstOperationOutcome.applied);
-        expect(operations.rejections, isEmpty);
-        expect(DstOracle.invariants(snapshot), isEmpty);
-        expect(operations.oracle.validate(snapshot, space), isEmpty);
-        expect(
-          snapshot.rows['unique'],
-          hasLength(
-            action == DstAction.updateBatch
-                ? 4
-                : action == DstAction.insert
-                ? 5
-                : 6,
-          ),
+    group('when a batch gives two new records the same unused name,', () {
+      late DstOperationOutcome outcome;
+      late DstSnapshot after;
+      setUp(() async {
+        final writes = [
+          Unique(id: ids.next(), name: 'unused'),
+          Unique(id: ids.next(), name: 'unused'),
+        ];
+        outcome = await operations.perform(
+          replica,
+          space,
+          table: DstTable.unique,
+          action: DstAction.insertBatch,
+          body: (tx, evidence, refusal) async {
+            for (final row in writes) {
+              evidence.write('unique', row.toJson());
+            }
+            await Unique.db.insert(replica.session, writes, transaction: tx);
+            return DstOperationOutcome.applied;
+          },
         );
-        expect(snapshot.projections, isNotEmpty);
-      },
-    );
-  }
+        after = await DstSnapshot.capture(replica);
+      });
+      test(
+        'then the refusal is predicted and all domain and authored state rolls back.',
+        () {
+          expect(outcome, DstOperationOutcome.rejected);
+          expect(operations.rejections, hasLength(1));
+          expect(operations.appliedPaths, isEmpty);
+          expect(after.renderSpace(space), before.renderSpace(space));
+          expect(after.renderRawMetadata(), before.renderRawMetadata());
+        },
+      );
+    });
+
+    group('when a batch update gives two records the same unused name,', () {
+      late DstOperationOutcome outcome;
+      late DstSnapshot after;
+      setUp(() async {
+        final writes = [
+          originals[1].copyWith(name: 'unused'),
+          originals[2].copyWith(name: 'unused'),
+        ];
+        outcome = await operations.perform(
+          replica,
+          space,
+          table: DstTable.unique,
+          action: DstAction.updateBatch,
+          body: (tx, evidence, refusal) async {
+            for (final row in writes) {
+              evidence.write('unique', row.toJson(), columns: {'name'});
+            }
+            await Unique.db.update(
+              replica.session,
+              writes,
+              columns: (t) => [t.name],
+              transaction: tx,
+            );
+            return DstOperationOutcome.applied;
+          },
+        );
+        after = await DstSnapshot.capture(replica);
+      });
+      test(
+        'then the refusal is predicted and all domain and authored state rolls back.',
+        () {
+          expect(outcome, DstOperationOutcome.rejected);
+          expect(operations.rejections, hasLength(1));
+          expect(operations.appliedPaths, isEmpty);
+          expect(after.renderSpace(space), before.renderSpace(space));
+          expect(after.renderRawMetadata(), before.renderRawMetadata());
+        },
+      );
+    });
+
+    group('when a predicate update gives two records the same unused name,', () {
+      late DstOperationOutcome outcome;
+      late DstSnapshot after;
+      setUp(() async {
+        final writes = [
+          originals[1].copyWith(name: 'unused'),
+          originals[2].copyWith(name: 'unused'),
+        ];
+        outcome = await operations.perform(
+          replica,
+          space,
+          table: DstTable.unique,
+          action: DstAction.updateWhere,
+          body: (tx, evidence, refusal) async {
+            for (final row in writes) {
+              evidence.write('unique', row.toJson(), columns: {'name'});
+            }
+            await Unique.db.updateWhere(
+              replica.session,
+              columnValues: (t) => [t.name('unused')],
+              where: (t) => t.id.inSet(<UuidValue>{originals[1].id!, originals[2].id!}),
+              transaction: tx,
+            );
+            return DstOperationOutcome.applied;
+          },
+        );
+        after = await DstSnapshot.capture(replica);
+      });
+      test(
+        'then the refusal is predicted and all domain and authored state rolls back.',
+        () {
+          expect(outcome, DstOperationOutcome.rejected);
+          expect(operations.rejections, hasLength(1));
+          expect(operations.appliedPaths, isEmpty);
+          expect(after.renderSpace(space), before.renderSpace(space));
+          expect(after.renderRawMetadata(), before.renderRawMetadata());
+        },
+      );
+    });
+  });
+
+  group(
+    'Given two children with distinct unique references and an occupied default town,',
+    () {
+      late DstIds ids;
+      late UuidValue space;
+      late DstReplica replica;
+      late DstOperations operations;
+      late Town town;
+      late DstSnapshot before;
+      setUp(() async {
+        final random = DstRandom(144);
+        ids = DstIds(random);
+        space = ids.next();
+        replica = await _replica(ids, [space]);
+        operations = DstOperations(random, ids);
+        await replica.seedDefaultTown(space);
+        town = Town(id: ids.next(), name: 'current');
+        await replica.withReplicaClock(
+          () => replica.session.db.transactionForUser(space, (tx) async {
+            await Town.db.insertRow(replica.session, town, transaction: tx);
+            await UniqueSetDefaultChild.db.insert(replica.session, [
+              UniqueSetDefaultChild(
+                id: ids.next(),
+                name: 'current-child',
+                parentId: town.id,
+              ),
+              UniqueSetDefaultChild(
+                id: ids.next(),
+                name: 'default-child',
+                parentId: const UuidValue.raw('550e8400-e29b-41d4-a716-446655440000'),
+              ),
+            ], transaction: tx);
+          }),
+        );
+        before = await DstSnapshot.capture(replica);
+      });
+      group(
+        'when deleting the other town would assign its child the occupied default,',
+        () {
+          late DstOperationOutcome outcome;
+          late DstSnapshot after;
+          setUp(() async {
+            outcome = await operations.perform(
+              replica,
+              space,
+              table: DstTable.town,
+              action: DstAction.delete,
+              body: (tx, evidence, refusal) async {
+                refusal.delete(DstTable.town, [town.id!]);
+                evidence.visibility('town', [town.id!], deleted: true);
+                await Town.db.deleteRow(replica.session, town, transaction: tx);
+                return DstOperationOutcome.applied;
+              },
+            );
+            after = await DstSnapshot.capture(replica);
+          });
+          test(
+            'then the unique refusal is predicted and the parent, children, and authored state remain unchanged.',
+            () {
+              expect(outcome, DstOperationOutcome.rejected);
+              expect(operations.rejections, hasLength(1));
+              expect(operations.appliedPaths, isEmpty);
+              expect(after.renderSpace(space), before.renderSpace(space));
+              expect(after.renderRawMetadata(), before.renderRawMetadata());
+            },
+          );
+        },
+      );
+    },
+  );
 
   test(
     'Given a cascade chain with a visible no-action blocker, '

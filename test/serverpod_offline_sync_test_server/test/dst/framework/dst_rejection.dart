@@ -1,3 +1,5 @@
+import 'dart:convert';
+
 import 'package:serverpod_offline_sync_test_client/serverpod_offline_sync_test_client.dart';
 
 import 'dst_authored.dart';
@@ -6,13 +8,64 @@ import 'dst_world.dart';
 
 /// Refusals justified by the concrete pre-operation graph and selected rows.
 /// This predicts only local refusal conditions, not merge-time visibility or
-/// unique winners. Supported competing unique claims must always commit.
+/// unique winners. Locally observable unique collisions must be refused;
+/// independently accepted claims are resolved when replicas merge.
 class DstRejection {
   DstRejection(this.before, this.space);
 
   final DstSnapshot before;
   final UuidValue space;
   final Set<(DstTable, UuidValue)> deleting = {};
+
+  /// Predict ordinary uniqueness from submitted values and visible rows,
+  /// independently of production projection or its preserved claim metadata.
+  Iterable<String> uniqueReasons(DstWriteEvidence writes) sync* {
+    for (final index in dstUniqueIndexes) {
+      final table = index.table.tableName;
+      final changed = writes.domainValues.entries.where(
+        (entry) => entry.key.$1 == table,
+      );
+      final repairs = {
+        for (final edge in dstForeignKeys)
+          if (edge.child == index.table &&
+              index.columns.contains(edge.column) &&
+              (edge.action == 'setNull' || edge.action == 'setDefault'))
+            for (final child in _children(edge))
+              if (!deleting.contains((edge.child, child)))
+                (child, edge.column): edge.action == 'setNull'
+                    ? null
+                    : edge.defaultValue,
+      };
+      if (repairs.isEmpty &&
+          !changed.any((entry) => index.columns.contains(entry.key.$3))) {
+        continue;
+      }
+      final rows = {
+        for (final entry in (before.visible[table] ?? {}).entries)
+          if (!deleting.contains((index.table, entry.key)))
+            entry.key: <String, Object?>{
+              ...entry.value.columns,
+              'spaceId': entry.value.spaceUuid.toString(),
+            },
+      };
+      for (final entry in repairs.entries) {
+        rows[entry.key.$1]![entry.key.$2] = entry.value;
+      }
+      for (final entry in changed) {
+        final row = rows.putIfAbsent(entry.key.$2, () => {'spaceId': space.toString()});
+        row[entry.key.$3] = entry.value;
+      }
+      final tuples = <String>{};
+      for (final row in rows.values) {
+        final tuple = [for (final column in index.columns) row[column]];
+        if (tuple.any((value) => value == null)) continue;
+        if (!tuples.add(jsonEncode(tuple.map(dstValue).toList()))) {
+          yield 'UNIQUE constraint failed: ${index.columns.map((column) => '$table.$column').join(', ')}';
+          break;
+        }
+      }
+    }
+  }
 
   /// This input namespace is reserved by the public unique-text contract.
   /// Keep the prediction independent of the production validator.
@@ -94,6 +147,7 @@ class DstRejection {
   bool accepts(String message, DstWriteEvidence writes) {
     if (reservedValueReasons(writes).contains(message)) return true;
     if (deleteReasons().any(message.contains)) return true;
+    if (uniqueReasons(writes).any(message.contains)) return true;
     // Restoring a hidden row can resubmit a retained reference whose target
     // is unavailable. Match the actual submitted column and target, never an
     // arbitrary FK/SQL exception. Generated fresh references are space-local.

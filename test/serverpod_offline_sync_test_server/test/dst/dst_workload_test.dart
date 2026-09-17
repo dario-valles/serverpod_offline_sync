@@ -61,7 +61,7 @@ void main() {
           operations.committed + operations.rejections.length + operations.skipped,
         );
         expect(operations.skipped, 0);
-        expect(operations.rejections, hasLength(2));
+        expect(operations.rejections, hasLength(3));
         expect(DstOracle.invariants(snapshot), isEmpty);
         expect(operations.oracle.validate(snapshot, space), isEmpty);
       },

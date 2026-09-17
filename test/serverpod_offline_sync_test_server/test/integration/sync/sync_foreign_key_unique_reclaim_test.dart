@@ -1,3 +1,5 @@
+import 'package:serverpod_database/serverpod_database.dart'
+    show DatabaseUniqueViolationException;
 import 'package:serverpod_offline_sync_server/serverpod_offline_sync_server.dart';
 import 'package:serverpod_offline_sync_test_client/serverpod_offline_sync_test_client.dart';
 import 'package:test/test.dart';
@@ -46,8 +48,7 @@ void main() {
   }
 
   group(
-    'Given a tombstoned child whose unique foreign key was repaired away and '
-    'whose parent was then restored,',
+    'Given a tombstoned child whose restored parent is now claimed by another visible child,',
     () {
       late SyncNode server;
       late SyncNode author;
@@ -124,81 +125,102 @@ void main() {
         await syncWithServer(restorer, server);
         await syncWithServer(author, server);
         await syncWithServer(deleter, server);
+        await syncWithServer(claimant, server);
+
+        final reclaim = UniqueSetNullChild(
+          id: const Uuid().v7obj(),
+          name: 'reclaim',
+          parentId: parent.id,
+        );
+        await claimant.offlineSync.db.transactionForUser(testCrdtUserId, (tx) async {
+          await UniqueSetNullChild.db.insertRow(
+            claimant.offlineSync,
+            reclaim,
+            transaction: tx,
+          );
+        });
+
+        await syncWithServer(claimant, server);
+        for (final peer in [author, deleter, restorer]) {
+          await syncWithServer(peer, server);
+        }
       });
 
-      group('when another client claims the restored person and everyone syncs,', () {
+      group('when the synchronized children are read,', () {
+        late String expected;
+        late List<String> actual;
+
         setUp(() async {
-          await syncWithServer(claimant, server);
+          expected = await render(server);
+          actual = [
+            for (final peer in [author, deleter, restorer, claimant])
+              await render(peer),
+          ];
+        });
 
-          final reclaim = UniqueSetNullChild(
-            id: const Uuid().v7obj(),
-            name: 'reclaim',
-            parentId: parent.id,
-          );
-          await claimant.offlineSync.db.transactionForUser(testCrdtUserId, (tx) async {
-            await UniqueSetNullChild.db.insertRow(
-              claimant.offlineSync,
-              reclaim,
-              transaction: tx,
-            );
-          });
+        test('then the merge has succeeded and all replicas agree.', () {
+          expect(actual, everyElement(expected));
+        });
+      });
 
-          await syncWithServer(claimant, server);
-          for (final peer in [author, deleter, restorer]) {
+      group('when the tombstoned child is restored with the occupied reference,', () {
+        late Object? restoreError;
+        late String before;
+        late List<String> factsBefore;
+        late List<String> factsAfter;
+
+        setUp(() async {
+          before = await render(author);
+          factsBefore = await _export(author);
+          // Reinserting a tombstoned row restores it
+          // (`CrdtDataDeletedReason.userReinsert`). Its attempted reference
+          // is still the parent, which another row now holds on a column
+          // that is unique across the table.
+          try {
+            await author.offlineSync.db.transactionForUser(testCrdtUserId, (
+              tx,
+            ) async {
+              await UniqueSetNullChild.db.insertRow(
+                author.offlineSync,
+                child,
+                transaction: tx,
+              );
+            });
+            restoreError = null;
+          } on Object catch (error) {
+            restoreError = error;
+          }
+          factsAfter = await _export(author);
+          for (final peer in [author, deleter, restorer, claimant]) {
             await syncWithServer(peer, server);
           }
         });
 
-        test('then the merge succeeds and all nodes agree.', () async {
+        test('then the database rejects the restore without publishing any facts.', () {
+          expect(restoreError, isA<DatabaseUniqueViolationException>());
+          expect(factsAfter, factsBefore);
+        });
+
+        test('then all nodes agree after syncing.', () async {
           final expected = await render(server);
+          expect(expected, before);
 
           expect(await render(author), expected, reason: 'author');
           expect(await render(deleter), expected, reason: 'deleter');
           expect(await render(restorer), expected, reason: 'restorer');
           expect(await render(claimant), expected, reason: 'claimant');
         });
-
-        group('and the tombstoned child is then restored,', () {
-          late Object? restoreError;
-
-          setUp(() async {
-            // Reinserting a tombstoned row restores it
-            // (`CrdtDataDeletedReason.userReinsert`). Its attempted reference
-            // is still the parent, which another row now holds on a column
-            // that is unique across the table.
-            try {
-              await author.offlineSync.db.transactionForUser(testCrdtUserId, (
-                tx,
-              ) async {
-                await UniqueSetNullChild.db.insertRow(
-                  author.offlineSync,
-                  child,
-                  transaction: tx,
-                );
-              });
-              restoreError = null;
-            } on Object catch (error) {
-              restoreError = error;
-            }
-          });
-
-          test('then the restore is resolved rather than failing the write.', () {
-            expect(restoreError, isNull);
-          });
-
-          test('then all nodes agree after syncing.', () async {
-            for (final peer in [author, deleter, restorer, claimant]) {
-              await syncWithServer(peer, server);
-            }
-            final expected = await render(server);
-
-            expect(await render(author), expected, reason: 'author');
-            expect(await render(deleter), expected, reason: 'deleter');
-            expect(await render(restorer), expected, reason: 'restorer');
-            expect(await render(claimant), expected, reason: 'claimant');
-          });
-        });
       });
     },
   );
+}
+
+Future<List<String>> _export(SyncNode node) async {
+  final changes = await node.sync
+      .collectPendingChanges(
+        node.raw,
+        checkpointsBySpaceUuid: {testCrdtUserId: const []},
+      )
+      .toList();
+  return changes.map((change) => change.toJson().toString()).toList()..sort();
 }
