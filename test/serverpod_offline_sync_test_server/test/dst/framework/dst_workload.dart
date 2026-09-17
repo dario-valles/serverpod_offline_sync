@@ -66,7 +66,7 @@ Future<void> populateDstSpace({
   }
 
   // Close every person/company/town cycle after the nullable forward edge's
-  // target exists. The initial graph observes all 28 declared FK edges.
+  // target exists.
   await _write(
     replica,
     space,
@@ -81,6 +81,23 @@ Future<void> populateDstSpace({
     ],
     DstAction.updateBatch,
     columns: {'oldCompanyId'},
+  );
+
+  // The self-referencing Types relation needs its parent batch to exist first.
+  await _write(
+    replica,
+    space,
+    operations,
+    DstTable.types,
+    [
+      for (var slot = 0; slot < width; slot++)
+        DstTable.types.model.fromJson({
+          ...rows[DstTable.types]![slot].toJson() as Map<String, dynamic>,
+          'parentId': rows[DstTable.types]![(slot + 1) % width].id!.toJson(),
+        }),
+    ],
+    DstAction.updateBatch,
+    columns: {'parentId'},
   );
 
   // Exchange distinct names, then exercise local uniqueness and reserved-name

@@ -4,6 +4,8 @@ import 'package:serverpod_database/serverpod_database.dart' as db;
 import 'package:serverpod_offline_sync_server/serverpod_offline_sync_server.dart';
 import 'package:serverpod_offline_sync_test_client/serverpod_offline_sync_test_client.dart'
     as models;
+import 'package:serverpod_offline_sync_test_shared/serverpod_offline_sync_test_shared.dart'
+    as shared;
 
 /// Models whose domain rows the simulation authors and compares.
 enum DstTable {
@@ -39,7 +41,9 @@ enum DstTable {
   fkChainSetNullMiddle('fk_chain_set_null_middle'),
   fkChainSetNullCascadeChild('fk_chain_set_null_cascade_child'),
   fkChainSetNullRestrictChild('fk_chain_set_null_restrict_child'),
-  fkChainSetNullSetNullChild('fk_chain_set_null_set_null_child');
+  fkChainSetNullSetNullChild('fk_chain_set_null_set_null_child'),
+  sharedParent('shared_parent'),
+  sharedChild('shared_child');
 
   const DstTable(this.tableName);
   final String tableName;
@@ -140,6 +144,14 @@ class DstModel<T extends db.TableRow<models.UuidValue?>> {
 }
 
 final dstModels = <DstTable, DstModel<db.TableRow<models.UuidValue?>>>{
+  DstTable.sharedParent: DstModel<shared.SharedParent>(
+    table: shared.SharedParent.t,
+    fromJson: shared.SharedParent.fromJson,
+  ),
+  DstTable.sharedChild: DstModel<shared.SharedChild>(
+    table: shared.SharedChild.t,
+    fromJson: shared.SharedChild.fromJson,
+  ),
   DstTable.types: DstModel<models.Types>(
     table: models.Types.t,
     fromJson: models.Types.fromJson,
@@ -283,11 +295,16 @@ Object? _columnValue(db.Column column, Object? value) {
     db.ColumnBigInt() => models.BigIntJsonExtension.fromJson(value),
     db.ColumnByteData() => models.ByteDataJsonExtension.fromJson(value),
     db.ColumnEnum<models.TypesEnum>() => models.TypesEnum.fromJson(value as int),
+    db.ColumnEnum<shared.SharedFlavor>() => shared.SharedFlavor.fromJson(
+      value as String,
+    ),
+    db.ColumnSerializable() ||
+    db.ColumnStructured() => models.Protocol().deserialize<dynamic>(value, column.type),
     _ => value,
   };
 }
 
-/// JSON inputs for the remaining scalar types in the generated Types model.
+/// JSON inputs for the remaining typed columns in the generated model catalog.
 /// Finite reals, UTC instants, wide integers, and variable-size binary values
 /// exercise ordinary persisted values without adding invalid ORM inputs.
 Object dstTypedScalarJson(String? dartType, int sample) =>
@@ -308,6 +325,14 @@ Object dstTypedScalarJson(String? dartType, int sample) =>
         ),
       ).toJson(),
       'protocol:TypesEnum' => sample % models.TypesEnum.values.length,
+      'serverpod_offline_sync_test_shared:SharedFlavor' =>
+        shared.SharedFlavor.values[sample % shared.SharedFlavor.values.length].toJson(),
+      'protocol:SyncDocument' => models.SyncDocument(
+        title: 'document-$sample',
+        enabled: sample.isEven,
+        numbers: [sample, -sample],
+      ).toJson(),
+      'List<int>' => [sample, -sample],
       _ => throw StateError('No DST scalar value for $dartType'),
     };
 
