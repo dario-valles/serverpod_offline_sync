@@ -372,8 +372,10 @@ class CrdtMutationRecorder {
     );
   }
 
-  /// Returns whether primary-key upserts preserve the existing projection.
-  Future<bool> prepareLocalUpsert<T extends TableRow>(
+  /// Captures the materialized values before an upsert so its accepted writes
+  /// can replace old attempted values without authoring unchanged projections.
+  Future<({bool projectionUnchanged, Map<MergeRowKey, Map<String, Object?>> domain})>
+  prepareLocalUpsert<T extends TableRow>(
     List<T> rows,
     List<Column> conflictColumns,
     List<Column>? updateColumns,
@@ -384,15 +386,17 @@ class CrdtMutationRecorder {
       for (final row in rows)
         if (row.id case final UuidValue rowId) rowId,
     };
-    if (conflictColumns.length == 1 &&
-        conflictColumns.single.columnName == 'id' &&
-        rowIds.length == rows.length) {
+    final targetsPrimaryKey =
+        conflictColumns.length == 1 && conflictColumns.single.columnName == 'id';
+    const emptyDomain = <MergeRowKey, Map<String, Object?>>{};
+    if (targetsPrimaryKey && rowIds.length == rows.length) {
       final stored = await _context.findCrdtRows(tableName, rowIds, transaction);
       if (stored.isEmpty &&
           !_foreignKeys.tablesWithDefaultDependencies.contains(tableName)) {
         // The full pass has no persisted seed or default to load. Classification
         // after the physical upsert still reads metadata again.
-        return false;
+        validateAuthoredRows(rows, null);
+        return (projectionUnchanged: false, domain: emptyDomain);
       }
       if (stored.length == rowIds.length &&
           await _foreignKeyProjector.canLeaveLocalProjectionUnchanged(
@@ -401,20 +405,82 @@ class CrdtMutationRecorder {
             inserting: false,
             columns: updateColumns,
           )) {
-        return true;
+        validateAuthoredRows(rows, updateColumns);
+        return (projectionUnchanged: true, domain: emptyDomain);
       }
     }
-    await projectCurrent(tableName, rowIds, transaction);
-    return false;
+    if (!targetsPrimaryKey && _foreignKeyProjector.needsProjection(tableName, null)) {
+      final suppliedValues = [for (final row in rows) row.toJsonForDatabase() as Map];
+      rowIds.addAll(
+        await _context.findDomainRowIdsWhereColumnsIn(
+          tableName: tableName,
+          valuesByColumn: {
+            for (final column in conflictColumns)
+              if (column.columnName != 'spaceId')
+                column.columnName: {
+                  for (final values in suppliedValues)
+                    canonicalDomainValue(
+                      values[column.columnName],
+                      _context.columnsByTableAndName[tableName]?[column.columnName],
+                    ),
+                },
+          },
+          transaction: transaction,
+        ),
+      );
+    }
+    final projected = await _foreignKeyProjector.project(
+      transaction,
+      seedTables: {tableName},
+      // Other conflict targets can update an existing row with a different id.
+      seedRows: {for (final rowId in rowIds) (tableName, rowId)},
+    );
+    if (_uniqueResolver.hasReservedUniqueColumns(tableName)) {
+      final written = updateColumns?.map((column) => column.columnName).toSet();
+      for (final row in rows) {
+        final supplied = _authoredValuesFromRow(row, null);
+        for (final MapEntry(key: column, value: value) in supplied.entries) {
+          if (!_uniqueResolver.isReservedValue(tableName, column, value)) continue;
+          final before =
+              projected.domain[(tableName, row.id)] ??
+              projected.domain.entries
+                  .where(
+                    (entry) =>
+                        entry.key.$1 == tableName &&
+                        conflictColumns.every(
+                          (key) =>
+                              key.columnName == 'spaceId' ||
+                              (key.columnName == 'id'
+                                  ? entry.key.$2 == row.id
+                                  : projectionValuesEqual(
+                                      entry.value[key.columnName],
+                                      supplied[key.columnName],
+                                    )),
+                        ),
+                  )
+                  .firstOrNull
+                  ?.value;
+          if (before != null &&
+              ((written != null && !written.contains(column)) ||
+                  projectionValuesEqual(before[column], value))) {
+            continue;
+          }
+          // A new claim must fail before the physical upsert can collide with
+          // another row's generated value. Unchanged echoes are checked after
+          // the write, when we know whether it updated or restored the row.
+          _uniqueResolver.validateAuthoredValue(tableName, column, value);
+        }
+      }
+    }
+    return (projectionUnchanged: false, domain: projected.domain);
   }
 
   /// Plans FK/unique projection for rows that are about to be inserted.
   ///
-  /// Releases hidden unique claims first and returns copies whose unique/FK
-  /// columns already hold the planned domain values, so the physical write
-  /// cannot violate an immediate unique index. Authored values that differ
-  /// from the planned domain are returned so they can be stored as attempted
-  /// values after the insert.
+  /// Releases hidden unique claims first and plans foreign key repairs while
+  /// preserving submitted unique values for database constraint enforcement.
+  /// Authored values that differ from the planned domain are returned so they
+  /// can be stored as attempted values after the insert.
   Future<({List<T> rows, ProjectionAttemptsByField attempts})>
   planLocalInserts<T extends TableRow>(
     List<T> rows,
@@ -427,6 +493,8 @@ class CrdtMutationRecorder {
         !_foreignKeyProjector.needsProjection(tableName, null)) {
       return (rows: rows, attempts: unplanned);
     }
+
+    validateAuthoredRows(rows, null);
 
     if (await _foreignKeyProjector.canLeaveLocalProjectionUnchanged(
       rows,
@@ -459,6 +527,7 @@ class CrdtMutationRecorder {
     final planned = await _foreignKeyProjector.project(
       transaction,
       pendingInserts: pending,
+      localWrite: true,
       seedTables: {tableName},
       seedRows: {for (final row in pending) (tableName, row.rowId)},
     );
@@ -496,8 +565,9 @@ class CrdtMutationRecorder {
   planLocalUpdates<T extends TableRow>(
     List<T> rows,
     List<Column>? columns,
-    Transaction transaction,
-  ) async {
+    Transaction transaction, {
+    bool restoring = false,
+  }) async {
     if (rows.isEmpty) return (rows: rows, projectionUnchanged: true);
     final tableName = rows.first.table.tableName;
     if (!_context.isCrdtTrackedTableName(tableName)) {
@@ -524,9 +594,7 @@ class CrdtMutationRecorder {
             row,
             columns,
           ).entries)
-            (tableName, row.id as UuidValue, columnName): canonicalDomainValue(
-              value,
-            ),
+            (tableName, row.id as UuidValue, columnName): value,
     };
     var overlays = authored;
     if (columns == null) {
@@ -548,9 +616,15 @@ class CrdtMutationRecorder {
             fieldKey: value,
       };
     }
+    _uniqueResolver.validateAuthoredFields(overlays);
     final planned = await _foreignKeyProjector.project(
       transaction,
       authoredOverlays: overlays,
+      localWrite: true,
+      restoringRows: {
+        if (restoring)
+          for (final row in rows) (tableName, row.id as UuidValue),
+      },
       seedTables: {tableName},
       seedRows: {
         for (final row in rows)
@@ -569,6 +643,30 @@ class CrdtMutationRecorder {
     );
   }
 
+  /// Validates unprojected ORM writes, or projected inserts with their attempts.
+  void validateAuthoredRows<T extends TableRow>(
+    List<T> rows,
+    List<Column>? columns, {
+    ProjectionAttemptsByField attempts = const {},
+  }) {
+    if (rows.isEmpty) return;
+    final tableName = rows.first.table.tableName;
+    if (!_uniqueResolver.hasReservedUniqueColumns(tableName)) return;
+    for (final row in rows) {
+      for (final MapEntry(key: columnName, value: value) in _authoredValuesFromRow(
+        row,
+        columns,
+      ).entries) {
+        final key = (tableName, row.id, columnName);
+        _uniqueResolver.validateAuthoredValue(
+          tableName,
+          columnName,
+          attempts.containsKey(key) ? attempts[key]!.value : value,
+        );
+      }
+    }
+  }
+
   Map<String, Object?> _authoredValuesFromRow<T extends TableRow>(
     T row,
     List<Column>? columns,
@@ -580,7 +678,11 @@ class CrdtMutationRecorder {
           column.columnName,
     ];
     return {
-      for (final columnName in columnNames) columnName: json[columnName],
+      for (final columnName in columnNames)
+        columnName: canonicalDomainValue(
+          json[columnName],
+          _context.columnsByTableAndName[row.table.tableName]?[columnName],
+        ),
     };
   }
 
@@ -659,6 +761,7 @@ class CrdtMutationRecorder {
     Transaction transaction, {
     ProjectionAttemptsByField attempts = const {},
   }) async {
+    validateAuthoredRows(insertedRows, null, attempts: attempts);
     await _forTrackedRows(insertedRows, transaction, (
       tableName,
       rowIds,
@@ -700,39 +803,36 @@ class CrdtMutationRecorder {
       rowIds,
       hlcManager,
     ) async {
-      final crdtDataRows = await _context.findRequiredCrdtRows(
-        tableName,
-        rowIds,
-        'reinserted',
+      final crdtDataRows = await _touchCrdtRows(
+        await _context.findRequiredCrdtRows(
+          tableName,
+          rowIds,
+          'reinserted',
+          transaction,
+        ),
+        hlcManager,
         transaction,
       );
-
-      await _touchCrdtRows(crdtDataRows, hlcManager, transaction);
+      // A reinsert authors the complete row at its new insertion timestamp.
+      // Retain attempted values while projecting, but discard their old ages.
+      await _context.resetReinsertedFieldClocks(crdtDataRows, transaction);
       await _context.markCrdtRowsDeleted(
         crdtDataRows,
         false,
         CrdtDataDeletedReason.userReinsert,
         transaction,
       );
-      // Every field to skip carries an attempted value: a repaired foreign key
-      // and a restored authored value are both subsets of that set, over a
-      // subset of its columns.
-      final skippedFields = await _foreignKeyProjector.findActiveAttemptedFields(
-        tableName: tableName,
-        rowIds: rowIds,
-        transaction: transaction,
-      );
-      // Reinsert is a full-row passthrough. Projected unique/FK columns must
-      // keep their original claim HLC so restoration can reclaim or lose
-      // without authoring a newer unique claim.
-      await _recordUpdatedFields(
-        reinsertedRows,
-        crdtDataRows,
-        null,
-        transaction,
-        skippedFields: skippedFields,
-      );
       await _maybeProject(tableName, rowIds, null, transaction);
+      // Only projected fields need a metadata row to hold their authored value.
+      // All other fields now inherit the insertion timestamp implicitly.
+      await CrdtDataField.db.deleteWhere(
+        _session,
+        where: (t) =>
+            t.rowId.inSet(crdtDataRows.map((row) => row.id!).toSet()) &
+            t.attemptedValue.id.equals(null),
+        transaction: transaction,
+        noReturn: true,
+      );
     });
   }
 
@@ -742,6 +842,7 @@ class CrdtMutationRecorder {
     List<Column>? columns,
     Transaction transaction, {
     bool projectionUnchanged = false,
+    Map<MergeRowKey, Map<String, Object?>> domainBeforeUpsert = const {},
   }) async {
     await _foreignKeyProjector.assertVisibleTargets(updatedRows, columns, transaction);
 
@@ -756,6 +857,24 @@ class CrdtMutationRecorder {
         'updated',
         transaction,
       );
+      // Only rows returned by the physical upsert were accepted by updateWhere.
+      // Explicit columns author even an unchanged null; full-row passthrough
+      // keeps the claim behind an unchanged displayed alternative.
+      final authoredOverlays = <MergeFieldKey, Object?>{
+        for (final row in updatedRows)
+          if (domainBeforeUpsert.containsKey((tableName, row.id)))
+            for (final MapEntry(key: columnName, value: value)
+                in _authoredValuesFromRow(row, columns).entries)
+              if ((domainBeforeUpsert[(tableName, row.id)]?.containsKey(columnName) ??
+                      false) &&
+                  (columns != null ||
+                      !projectionValuesEqual(
+                        domainBeforeUpsert[(tableName, row.id)]![columnName],
+                        value,
+                      )))
+                (tableName, row.id as UuidValue, columnName): value,
+      };
+      _uniqueResolver.validateAuthoredFields(authoredOverlays);
       final implicitForeignKeyRepairFields = columns == null
           ? await _foreignKeyProjector.findImplicitRepairFields(
               tableName: tableName,
@@ -768,7 +887,9 @@ class CrdtMutationRecorder {
         crdtDataRows,
         columns,
         transaction,
-        skippedFields: implicitForeignKeyRepairFields,
+        skippedFields: implicitForeignKeyRepairFields.difference(
+          authoredOverlays.keys.toSet(),
+        ),
       );
       if (projectionUnchanged &&
           await _foreignKeyProjector.canLeaveLocalProjectionUnchanged(
@@ -785,6 +906,7 @@ class CrdtMutationRecorder {
         rowIds,
         updatedColumnNames,
         transaction,
+        authoredOverlays: authoredOverlays,
       );
     });
   }
@@ -793,13 +915,15 @@ class CrdtMutationRecorder {
     String tableName,
     Set<UuidValue> rowIds,
     Set<String>? columnNames,
-    Transaction transaction,
-  ) async {
+    Transaction transaction, {
+    Map<MergeFieldKey, Object?> authoredOverlays = const {},
+  }) async {
     if (_foreignKeyProjector.needsProjection(tableName, columnNames)) {
       await _foreignKeyProjector.project(
         transaction,
         seedTables: {tableName},
         seedRows: {for (final rowId in rowIds) (tableName, rowId)},
+        authoredOverlays: authoredOverlays,
       );
     }
   }
@@ -843,14 +967,14 @@ class CrdtMutationRecorder {
     );
   }
 
-  Future<void> _touchCrdtRows(
+  Future<List<CrdtDataRow>> _touchCrdtRows(
     List<CrdtDataRow> rows,
     HlcManager hlcManager,
     Transaction transaction,
   ) async {
-    if (rows.isEmpty) return;
+    if (rows.isEmpty) return [];
 
-    await CrdtDataRow.db.update(
+    return CrdtDataRow.db.update(
       _session,
       [for (final row in rows) _context.withNextHlc(row, hlcManager)],
       columns: (t) => [t.nodeId, t.hlcDatetime, t.hlcCounter],

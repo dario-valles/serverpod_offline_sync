@@ -49,6 +49,10 @@ class DstAdversary {
   /// Creates an adversary over [replicas].
   DstAdversary(this.random, this.replicas);
 
+  static const receiveIsolationProbability = 0.2;
+  static const collectionProbability = 0.8;
+  static const resendProbability = 0.15;
+
   /// The simulation's randomness.
   final DstRandom random;
 
@@ -62,6 +66,18 @@ class DstAdversary {
 
   /// Batches merged so far, for reporting how much work a seed actually did.
   int mergeCount = 0;
+  int receiveIsolationEvents = 0;
+  int duplicateBatches = 0;
+  int maxBatchSize = 0;
+  int deliveredChanges = 0;
+
+  Map<String, int> get metrics => {
+    'merges': mergeCount,
+    'receiveIsolationEvents': receiveIsolationEvents,
+    'duplicateBatches': duplicateBatches,
+    'maxBatchSize': maxBatchSize,
+    'deliveredChanges': deliveredChanges,
+  };
 
   /// Advances the schedule by one round.
   ///
@@ -70,8 +86,8 @@ class DstAdversary {
   Future<void> step(Future<void> Function(DstReplica) onMerged) async {
     _round++;
 
-    if (random.chance(0.2)) _partitionRandomReplica();
-    if (random.chance(0.8)) await _collectFromRandomReplica();
+    if (random.chance(receiveIsolationProbability)) _partitionRandomReplica();
+    if (random.chance(collectionProbability)) await _collectFromRandomReplica();
 
     final deliveries = random.between(1, 3);
     for (var index = 0; index < deliveries; index++) {
@@ -89,7 +105,7 @@ class DstAdversary {
     for (var pass = 0; pass < _maxQuiescePasses; pass++) {
       for (final replica in replicas) {
         for (final spaceUuid in replica.spaceUuids) {
-          await _collect(replica, spaceUuid);
+          await _collect(replica, spaceUuid, allowResend: false);
         }
       }
       if (_pending.isEmpty) return;
@@ -107,6 +123,7 @@ class DstAdversary {
   }
 
   void _partitionRandomReplica() {
+    receiveIsolationEvents++;
     final replica = random.pick(replicas);
     _partitionedUntil[replica.name] = _round + random.between(1, 3);
   }
@@ -123,7 +140,11 @@ class DstAdversary {
 
   /// Collects [source]'s changes for [spaceUuid] and queues them for every
   /// other replica that holds the space.
-  Future<void> _collect(DstReplica source, UuidValue spaceUuid) async {
+  Future<void> _collect(
+    DstReplica source,
+    UuidValue spaceUuid, {
+    bool allowResend = true,
+  }) async {
     final changes = await source.collect(spaceUuid);
     if (changes.isEmpty) return;
 
@@ -134,7 +155,9 @@ class DstAdversary {
       final delivered = _deliveredKeys.putIfAbsent(target.name, () => {});
       // Occasionally resend what the target already merged. Redelivery must be
       // a no-op, so this is the idempotence probe rather than wasted work.
-      final resend = random.chance(0.15);
+      // During quiescence only newly observed facts can keep the network busy;
+      // deliberate duplicates must not masquerade as merge-authored changes.
+      final resend = allowResend && random.chance(resendProbability);
       final fresh = resend
           ? changes
           : [
@@ -144,7 +167,7 @@ class DstAdversary {
       if (fresh.isEmpty) continue;
 
       _pending.add(
-        DstDelivery(target: target, spaceUuid: spaceUuid, changes: fresh),
+        DstDelivery(target: target, spaceUuid: spaceUuid, changes: changes),
       );
     }
   }
@@ -173,6 +196,12 @@ class DstAdversary {
         'Batch:\n  $keys',
       );
     }
+    final prior = _deliveredKeys[delivery.target.name] ?? {};
+    if (delivery.changes.any((change) => prior.contains(dstChangeKey(change)))) {
+      duplicateBatches++;
+    }
+    if (delivery.changes.length > maxBatchSize) maxBatchSize = delivery.changes.length;
+    deliveredChanges += delivery.changes.length;
     mergeCount++;
     _trace(delivery);
 

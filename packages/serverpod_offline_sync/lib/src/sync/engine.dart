@@ -900,7 +900,7 @@ class OfflineSyncEngine {
       return (
         exists: true,
         ownerSpaceId: spaceId,
-        value: canonicalDomainValue(attempted.value),
+        value: attempted.value,
       );
     }
 
@@ -1208,7 +1208,7 @@ extension on Map<String, dynamic> {
     for (final field in attemptedValueFields) {
       final attempted = field.attemptedValue;
       if (attempted == null) continue;
-      this[field.column!.name] = canonicalDomainValue(attempted.value);
+      this[field.column!.name] = attempted.value;
     }
   }
 }

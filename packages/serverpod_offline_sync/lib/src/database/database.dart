@@ -432,7 +432,7 @@ class OfflineSyncDatabase implements Database {
       (tx) async {
         final prepared = _prepareRowsForInsert(rows, tx);
         final values = _recorder.withForeignKeyInsertDefaults(prepared.rows);
-        final projectionUnchanged = await _recorder.prepareLocalUpsert(
+        final projection = await _recorder.prepareLocalUpsert(
           values,
           conflictColumns,
           updateColumns,
@@ -475,7 +475,8 @@ class OfflineSyncDatabase implements Database {
           updatedRows,
           updateColumns,
           tx,
-          projectionUnchanged: projectionUnchanged,
+          projectionUnchanged: projection.projectionUnchanged,
+          domainBeforeUpsert: projection.domain,
         );
         if (noReturn) return <T>[];
         _stripStampedRows(result, prepared);
@@ -519,11 +520,24 @@ class OfflineSyncDatabase implements Database {
         if (deletedRowIds.contains(row.id)) row,
     ];
     if (rowsToReinsert.isEmpty) return [];
+    // Hidden targets were filtered out of the delegate's upsert results, so
+    // its duplicate-target check cannot see these restorations. Check the
+    // submitted identities before turning them into ordinary updates.
+    if (rowsToReinsert.map((row) => row.id).toSet().length != rowsToReinsert.length) {
+      throw DatabaseQueryException(
+        'ON CONFLICT DO UPDATE command cannot affect row a second time',
+        code: switch (dialect) {
+          DatabaseDialect.postgres => PgErrorCode.cardinalityViolation,
+          DatabaseDialect.sqlite => SqliteErrorCode.integrityConstraintViolation,
+        },
+      );
+    }
 
     final plannedReinserts = await _recorder.planLocalUpdates(
       rowsToReinsert,
       null,
       transaction,
+      restoring: true,
     );
     final reinsertedRows = await _delegate.update<T>(
       plannedReinserts.rows,
@@ -789,6 +803,7 @@ class OfflineSyncDatabase implements Database {
         );
 
         final columns = columnValues.map((e) => e.column).toList();
+        _recorder.validateAuthoredRows(result, columns);
         await _recorder.afterUpdate(result, columns, tx);
         if (noReturn) return <T>[];
         result.forEach(_stripSpaceId);

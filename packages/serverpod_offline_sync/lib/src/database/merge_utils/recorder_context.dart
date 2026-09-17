@@ -278,6 +278,32 @@ WHERE r."spaceId" = $spaceId AND r."tblId" = $childTableId
     );
   }
 
+  /// Reauthors existing fields at their row's newly persisted insertion HLC.
+  ///
+  /// This runs before reprojection so unique claims use their new age. Updating
+  /// in place preserves attempted values whose foreign key cascades on field
+  /// deletion. [rows] carries the newly stamped metadata returned by the row
+  /// update, so no field or domain reads are needed. Ordinary field records can
+  /// be removed once projection is complete.
+  Future<void> resetReinsertedFieldClocks(
+    List<CrdtDataRow> rows,
+    Transaction transaction,
+  ) async {
+    for (final row in rows) {
+      await CrdtDataField.db.updateWhere(
+        databaseSession,
+        columnValues: (t) => [
+          t.nodeId(row.nodeId),
+          t.hlcDatetime(row.hlcDatetime),
+          t.hlcCounter(row.hlcCounter),
+        ],
+        where: (t) => t.rowId.equals(row.id),
+        transaction: transaction,
+        noReturn: true,
+      );
+    }
+  }
+
   Future<void> recordFieldsUpdatedByTable(
     String tableName,
     Set<UuidValue> rowIds,
@@ -651,6 +677,16 @@ WHERE (${domainColumnPredicate('spaceId', spaceId)})
     };
   }
 
+  /// Encodes model or merge values using the same column-aware encoder as ORM
+  /// writes. The generated column retains semantics such as DateTime, Duration,
+  /// binary data, and structured JSON that a SQL storage type alone cannot.
+  String encodeDomainColumnValue(String tableName, String columnName, Object? value) {
+    final column = syncTableByName[tableName]!.columns.singleWhere(
+      (column) => column.columnName == columnName,
+    );
+    return ValueEncoder.instance.encodeColumnValue(column, value);
+  }
+
   Future<void> updateDomainRows(
     String tableName,
     Set<UuidValue> rowIds,
@@ -659,18 +695,12 @@ WHERE (${domainColumnPredicate('spaceId', spaceId)})
   ) async {
     if (rowIds.isEmpty || updates.isEmpty) return;
 
-    final columns = {
-      for (final column in syncTableByName[tableName]!.columns)
-        column.columnName: column,
-    };
     final assignments = updates.entries
-        .map((entry) {
-          final value = ValueEncoder.instance.encodeColumnValue(
-            columns[entry.key]!,
-            entry.value,
-          );
-          return '"${entry.key.escapeIdentifier()}" = $value';
-        })
+        .map(
+          (e) =>
+              '"${e.key.escapeIdentifier()}" = '
+              '${encodeDomainColumnValue(tableName, e.key, e.value)}',
+        )
         .join(', ');
 
     await database.unsafeExecute(
@@ -735,10 +765,13 @@ WHERE "id" IN (${rowIds.sqlLiteralList()})
         }
       case CrdtUniqueConflictReleaseKind.syntheticUuid:
         if (value != null) {
-          return const Uuid().v5obj(
+          final hash = const Uuid().v5(
             Namespace.oid.value,
             '$tableName.${column.columnName}:${value}__${releaseSuffix}__$conflictingId',
           );
+          // Keep the deterministic payload, but mark these custom UUIDs with
+          // version 8 so authored values can be rejected without domain reads.
+          return UuidValue.fromString(hash.replaceRange(14, 15, '8'));
         }
     }
 
@@ -879,9 +912,16 @@ WHERE c."id" IN ($whereRowIds)
     );
     if (result.isEmpty) return null;
 
+    final foreignKeyIndex = result.first[0] as int;
     return (
-      foreignKeyIndex: result.first[0] as int,
-      value: result.first[1] as Object,
+      foreignKeyIndex: foreignKeyIndex,
+      // Raw SQLite UUID columns are blobs; report the authored identifier.
+      value: canonicalDomainValue(
+        result.first[1],
+        columnsByTableAndName[childTableName]?[foreignKeys[foreignKeyIndex]
+            .columns
+            .single],
+      )!,
     );
   }
 
